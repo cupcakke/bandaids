@@ -1,0 +1,194 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  ZIG_VERSION: "0.14.1"
+  FUTHARK_VERSION: "0.26.4"
+
+jobs:
+  build-and-test:
+    name: Zig build and test suite
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Cache Zig toolchain
+        id: cache-zig
+        uses: actions/cache@v4
+        with:
+          path: /opt/zig
+          key: zig-${{ env.ZIG_VERSION }}-linux-x86_64
+
+      - name: Install Zig
+        if: steps.cache-zig.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p /opt/zig
+          curl -sSL --retry 3 --retry-delay 5 \
+            "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz" \
+            -o /tmp/zig.tar.xz
+          tar -xJf /tmp/zig.tar.xz -C /opt/zig --strip-components=1
+          rm /tmp/zig.tar.xz
+
+      - name: Register Zig on PATH
+        run: |
+          set -euo pipefail
+          echo "/opt/zig" >> "$GITHUB_PATH"
+
+      - name: Verify Zig version
+        run: |
+          set -euo pipefail
+          zig version
+          test "$(zig version)" = "${ZIG_VERSION}"
+
+      - name: Cache Futhark toolchain
+        id: cache-futhark
+        uses: actions/cache@v4
+        with:
+          path: /opt/futhark
+          key: futhark-${{ env.FUTHARK_VERSION }}-linux-x86_64
+
+      - name: Install Futhark
+        if: steps.cache-futhark.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p /opt/futhark
+          curl -sSL --retry 3 --retry-delay 5 \
+            "https://github.com/diku-dk/futhark/releases/download/v${FUTHARK_VERSION}/futhark-${FUTHARK_VERSION}-linux-x86_64.tar.xz" \
+            -o /tmp/futhark.tar.xz
+          tar -xJf /tmp/futhark.tar.xz -C /opt/futhark --strip-components=1
+          rm /tmp/futhark.tar.xz
+
+      - name: Register Futhark on PATH
+        run: |
+          set -euo pipefail
+          echo "/opt/futhark/bin" >> "$GITHUB_PATH"
+
+      - name: Verify Futhark version
+        run: |
+          set -euo pipefail
+          futhark --version
+          futhark --version | grep -F "${FUTHARK_VERSION}"
+
+      - name: Sync Futhark package dependencies
+        working-directory: src/hw/accel
+        run: |
+          set -euo pipefail
+          futhark pkg sync
+
+      - name: Type-check GPU kernel source
+        run: |
+          set -euo pipefail
+          futhark check src/hw/accel/main.fut
+
+      - name: Type-check CPU kernel source
+        run: |
+          set -euo pipefail
+          futhark check src/hw/accel/futhark_kernels.fut
+
+      - name: Build CPU Futhark library
+        run: |
+          set -euo pipefail
+          futhark c --library src/hw/accel/futhark_kernels.fut \
+            -o src/hw/accel/futhark_kernels
+
+      - name: Verify code formatting
+        run: |
+          set -euo pipefail
+          zig fmt --check build.zig src/
+
+      - name: Build inference server
+        run: |
+          set -euo pipefail
+          zig build -Doptimize=ReleaseSafe
+
+      - name: Run full test suite
+        run: |
+          set -euo pipefail
+          zig build test-all -Doptimize=Debug
+
+  gpu-source-check:
+    name: GPU target source validation
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Cache Futhark toolchain
+        id: cache-futhark-gpu
+        uses: actions/cache@v4
+        with:
+          path: /opt/futhark
+          key: futhark-${{ env.FUTHARK_VERSION }}-linux-x86_64
+
+      - name: Install Futhark
+        if: steps.cache-futhark-gpu.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p /opt/futhark
+          curl -sSL --retry 3 --retry-delay 5 \
+            "https://github.com/diku-dk/futhark/releases/download/v${FUTHARK_VERSION}/futhark-${FUTHARK_VERSION}-linux-x86_64.tar.xz" \
+            -o /tmp/futhark.tar.xz
+          tar -xJf /tmp/futhark.tar.xz -C /opt/futhark --strip-components=1
+          rm /tmp/futhark.tar.xz
+
+      - name: Register Futhark on PATH
+        run: |
+          set -euo pipefail
+          echo "/opt/futhark/bin" >> "$GITHUB_PATH"
+
+      - name: Sync Futhark package dependencies
+        working-directory: src/hw/accel
+        run: |
+          set -euo pipefail
+          futhark pkg sync
+
+      - name: Confirm training entry points are present
+        run: |
+          set -euo pipefail
+          for entry in \
+            batch_add_reconstruction_delta_masked \
+            batch_compute_reconstruction_loss_masked \
+            embedding_sum_squares \
+            batch_rsf_inverse \
+            training_step; do
+            grep -qE "^entry ${entry}\b" src/hw/accel/main.fut || {
+              echo "missing required entry: ${entry}" >&2
+              exit 1
+            }
+          done
+
+  python-checks:
+    name: Deployment script validation
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Byte-compile deployment scripts
+        run: |
+          set -euo pipefail
+          python -m compileall -q scripts src/scripts
+
+      - name: Lint deployment scripts
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet ruff
+          ruff check --select E9,F63,F7,F82 scripts src/scripts
