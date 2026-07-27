@@ -924,6 +924,106 @@ pub fn main() !void {
         return error.InvalidConfig;
     }
 
+    const reconstruction_alpha_string_owned: ?[]u8 = std.process.getEnvVarOwned(
+        allocator,
+        "JAIDE_RECONSTRUCTION_ALPHA",
+    ) catch null;
+    defer if (reconstruction_alpha_string_owned) |owned| allocator.free(owned);
+
+    const reconstruction_alpha: f32 = if (reconstruction_alpha_string_owned) |value|
+        std.fmt.parseFloat(f32, value) catch |err| {
+            std.debug.print(
+                "[Rank {d}] ERROR: invalid JAIDE_RECONSTRUCTION_ALPHA='{s}': {}\n",
+                .{ rank, value, err },
+            );
+            return error.InvalidConfig;
+        }
+    else
+        0.3;
+
+    if (!std.math.isFinite(reconstruction_alpha) or reconstruction_alpha < 0.0 or reconstruction_alpha > 1.0) {
+        std.debug.print(
+            "[Rank {d}] ERROR: JAIDE_RECONSTRUCTION_ALPHA must be within [0.0, 1.0], got {d}\n",
+            .{ rank, reconstruction_alpha },
+        );
+        return error.InvalidConfig;
+    }
+
+    const phase_a_steps_string_owned: ?[]u8 = std.process.getEnvVarOwned(
+        allocator,
+        "JAIDE_PHASE_A_STEPS",
+    ) catch null;
+    defer if (phase_a_steps_string_owned) |owned| allocator.free(owned);
+
+    const phase_a_steps: u64 = if (phase_a_steps_string_owned) |value|
+        std.fmt.parseInt(u64, value, 10) catch |err| {
+            std.debug.print(
+                "[Rank {d}] ERROR: invalid JAIDE_PHASE_A_STEPS='{s}': {}\n",
+                .{ rank, value, err },
+            );
+            return error.InvalidConfig;
+        }
+    else
+        500;
+
+    const phase_b_steps_string_owned: ?[]u8 = std.process.getEnvVarOwned(
+        allocator,
+        "JAIDE_PHASE_B_STEPS",
+    ) catch null;
+    defer if (phase_b_steps_string_owned) |owned| allocator.free(owned);
+
+    const phase_b_steps: u64 = if (phase_b_steps_string_owned) |value|
+        std.fmt.parseInt(u64, value, 10) catch |err| {
+            std.debug.print(
+                "[Rank {d}] ERROR: invalid JAIDE_PHASE_B_STEPS='{s}': {}\n",
+                .{ rank, value, err },
+            );
+            return error.InvalidConfig;
+        }
+    else
+        2000;
+
+    if (std.math.add(u64, phase_a_steps, phase_b_steps) catch null == null) {
+        std.debug.print(
+            "[Rank {d}] ERROR: JAIDE_PHASE_A_STEPS + JAIDE_PHASE_B_STEPS overflows\n",
+            .{rank},
+        );
+        return error.InvalidConfig;
+    }
+
+    const shuffle_control_string_owned: ?[]u8 = std.process.getEnvVarOwned(
+        allocator,
+        "JAIDE_SHUFFLE_TARGET_CONTROL",
+    ) catch null;
+    defer if (shuffle_control_string_owned) |owned| allocator.free(owned);
+
+    const shuffle_target_control: bool = if (shuffle_control_string_owned) |value|
+        std.mem.eql(u8, value, "1") or std.mem.eql(u8, value, "true")
+    else
+        false;
+
+    const frozen_target_string_owned: ?[]u8 = std.process.getEnvVarOwned(
+        allocator,
+        "JAIDE_TARGET_SOURCE_FROZEN",
+    ) catch null;
+    defer if (frozen_target_string_owned) |owned| allocator.free(owned);
+
+    const target_source_frozen: bool = if (frozen_target_string_owned) |value|
+        !(std.mem.eql(u8, value, "0") or std.mem.eql(u8, value, "false"))
+    else
+        true;
+
+    const depth_compensation_string_owned: ?[]u8 = std.process.getEnvVarOwned(
+        allocator,
+        "JAIDE_SPECTRAL_DEPTH_COMPENSATION",
+    ) catch null;
+    defer if (depth_compensation_string_owned) |owned| allocator.free(owned);
+
+    const spectral_depth_compensation: bool = if (depth_compensation_string_owned) |value|
+        !(std.mem.eql(u8, value, "0") or std.mem.eql(u8, value, "false"))
+    else
+        true;
+
     const dataset_path_owned: ?[]u8 = std.process.getEnvVarOwned(
         allocator,
         "JAIDE_DATASET",
@@ -1093,6 +1193,12 @@ pub fn main() !void {
         trainer_config.learning_rate = learning_rate;
         trainer_config.reasoning_cycles = reasoning_cycles;
         trainer_config.relational_pass_interval = relational_pass_interval;
+        trainer_config.reconstruction_alpha = reconstruction_alpha;
+        trainer_config.phase_a_steps = phase_a_steps;
+        trainer_config.phase_b_steps = phase_b_steps;
+        trainer_config.shuffle_target_control = shuffle_target_control;
+        trainer_config.target_source_frozen = target_source_frozen;
+        trainer_config.spectral_depth_compensation = spectral_depth_compensation;
 
         const components = TrainerComponents{
             .tokenizer = tokenizer,
@@ -1113,6 +1219,14 @@ pub fn main() !void {
     std.debug.print(
         "[Rank {d}] learning_rate={d}\n",
         .{ rank, learning_rate },
+    );
+    std.debug.print(
+        "[Rank {d}] reconstruction_alpha={d} phase_a_steps={d} phase_b_steps={d}\n",
+        .{ rank, reconstruction_alpha, phase_a_steps, phase_b_steps },
+    );
+    std.debug.print(
+        "[Rank {d}] target_source_frozen={} shuffle_target_control={} spectral_depth_compensation={}\n",
+        .{ rank, target_source_frozen, shuffle_target_control, spectral_depth_compensation },
     );
     std.debug.print(
         "[Rank {d}] Futhark trainer initialized with model_dim={d}, layers={d}\n",

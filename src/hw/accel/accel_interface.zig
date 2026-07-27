@@ -545,7 +545,8 @@ pub const RSFLayer = struct {
 
 pub const TrainingStepResult = struct {
     loss: f16,
-    input_gradient: FutharkArray3DF16,
+    reconstruction_loss: f16,
+    input_delta: FutharkArray3DF16,
 };
 
 pub const RSFAccelerator = struct {
@@ -565,6 +566,15 @@ pub const RSFAccelerator = struct {
     }
 
     pub fn initMultiLayer(model_dim: usize, num_layers: usize, allocator: std.mem.Allocator) AccelError!Self {
+        return initMultiLayerWithDepthScale(model_dim, num_layers, allocator, true);
+    }
+
+    pub fn initMultiLayerWithDepthScale(
+        model_dim: usize,
+        num_layers: usize,
+        allocator: std.mem.Allocator,
+        depth_compensation: bool,
+    ) AccelError!Self {
         if (model_dim == 0) return AccelError.InvalidDimensions;
         if (model_dim % 2 != 0) return AccelError.InvalidDimensions;
         if (num_layers == 0) return AccelError.InvalidDimensions;
@@ -574,7 +584,11 @@ pub const RSFAccelerator = struct {
         errdefer ctx.deinit();
 
         const base_seed: u64 = 0x4A41494445204E4F;
-        const init_stddev: f32 = 0.25 / @sqrt(@as(f32, @floatFromInt(half)));
+        const depth_scale: f32 = if (depth_compensation)
+            1.0 / @sqrt(@as(f32, @floatFromInt(num_layers)))
+        else
+            1.0;
+        const init_stddev: f32 = depth_scale * 0.25 / @sqrt(@as(f32, @floatFromInt(half)));
 
         var layers = allocator.alloc(RSFLayer, num_layers) catch return AccelError.AllocationFailed;
         errdefer allocator.free(layers);
@@ -704,6 +718,8 @@ pub const RSFAccelerator = struct {
         sequence_lengths: []const usize,
         learning_rate: f16,
         momentum: f16,
+        reconstruction_alpha: f16,
+        forward_scale: f16,
     ) AccelError!TrainingStepResult {
         if (!self.initialized) return AccelError.NullPointer;
         if (self.ctx.ctx == null) return AccelError.NullPointer;
@@ -940,6 +956,58 @@ pub const RSFAccelerator = struct {
             layer_input_reconstructed = null;
         }
 
+        const reconstructed_input = current_act orelse return AccelError.FutharkBackwardFailed;
+
+        var recon_loss_bits: u16 = 0;
+        const recon_loss_result = futhark.futhark_entry_batch_compute_reconstruction_loss_masked(
+            self.ctx.ctx,
+            &recon_loss_bits,
+            reconstructed_input,
+            inputs.arr,
+            lengths_array.arr,
+        );
+        if (recon_loss_result != 0) {
+            const error_string = futhark.futhark_context_get_error(self.ctx.ctx);
+            if (error_string) |message| std.debug.print(
+                "[Futhark batch_compute_reconstruction_loss_masked error] {s}\n",
+                .{std.mem.span(message)},
+            );
+            return AccelError.FutharkComputeLossFailed;
+        }
+        const reconstruction_loss: f16 = @bitCast(recon_loss_bits);
+
+        const alpha_bits: u16 = @bitCast(reconstruction_alpha);
+        const forward_scale_bits: u16 = @bitCast(forward_scale);
+        const combined_delta_result = blk: {
+            var combined_delta: ?*futhark.struct_futhark_f16_3d = null;
+            const rc = futhark.futhark_entry_batch_add_reconstruction_delta_masked(
+                self.ctx.ctx,
+                &combined_delta,
+                grad_out,
+                reconstructed_input,
+                inputs.arr,
+                lengths_array.arr,
+                alpha_bits,
+                forward_scale_bits,
+            );
+            if (rc != 0 or combined_delta == null) {
+                const error_string = futhark.futhark_context_get_error(self.ctx.ctx);
+                if (error_string) |message| std.debug.print(
+                    "[Futhark batch_add_reconstruction_delta_masked error] {s}\n",
+                    .{std.mem.span(message)},
+                );
+                if (combined_delta) |delta| _ = futhark.futhark_free_f16_3d(self.ctx.ctx, delta);
+                break :blk @as(?*futhark.struct_futhark_f16_3d, null);
+            }
+            break :blk combined_delta;
+        };
+        if (combined_delta_result == null) return AccelError.FutharkBackwardFailed;
+
+        if (grad_out) |gradient| _ = futhark.futhark_free_f16_3d(self.ctx.ctx, gradient);
+        grad_out = combined_delta_result;
+
+        try self.ctx.sync();
+
         if (current_act_owned) {
             if (current_act) |activation| {
                 _ = futhark.futhark_free_f16_3d(self.ctx.ctx, activation);
@@ -948,12 +1016,13 @@ pub const RSFAccelerator = struct {
             current_act_owned = false;
         }
 
-        const input_gradient_pointer = grad_out orelse return AccelError.FutharkBackwardFailed;
+        const input_delta_pointer = grad_out orelse return AccelError.FutharkBackwardFailed;
         grad_out = null;
         return TrainingStepResult{
             .loss = loss,
-            .input_gradient = FutharkArray3DF16{
-                .arr = input_gradient_pointer,
+            .reconstruction_loss = reconstruction_loss,
+            .input_delta = FutharkArray3DF16{
+                .arr = input_delta_pointer,
                 .dim0 = inputs.dim0,
                 .dim1 = inputs.dim1,
                 .dim2 = inputs.dim2,
@@ -1592,6 +1661,31 @@ pub const EmbeddingAccelerator = struct {
         const old_g = self.grad_weight.arr;
         self.grad_weight.arr = zeroed_grad.arr;
         _ = futhark.futhark_free_f16_2d(self.ctx.ctx, old_g);
+    }
+
+    pub fn sourceSumSquares(self: *Self) AccelError!f32 {
+        if (!self.initialized) return AccelError.NullPointer;
+        if (self.ctx.ctx == null) return AccelError.NullPointer;
+        if (self.weight.arr == null) return AccelError.NullPointer;
+        var total: f32 = 0.0;
+        const rc = futhark.futhark_entry_embedding_sum_squares(
+            self.ctx.ctx,
+            &total,
+            self.weight.arr,
+        );
+        if (rc != 0) return AccelError.FutharkComputeLossFailed;
+        if (futhark.futhark_context_sync(self.ctx.ctx) != 0) return AccelError.FutharkSyncFailed;
+        if (!std.math.isFinite(total)) return 0.0;
+        return total;
+    }
+
+    pub fn sourceRootMeanSquare(self: *Self) AccelError!f32 {
+        const total = try self.sourceSumSquares();
+        const count = std.math.mul(usize, self.vocab_size, self.dim) catch return AccelError.InvalidDimensions;
+        if (count == 0) return 0.0;
+        const mean = total / @as(f32, @floatFromInt(count));
+        if (!std.math.isFinite(mean) or mean <= 0.0) return 0.0;
+        return @sqrt(mean);
     }
 
     pub fn readGradFlat(self: *Self, allocator: std.mem.Allocator) AccelError![]f16 {

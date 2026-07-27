@@ -139,7 +139,7 @@ pub const TrainerConfig = struct {
     momentum: f32 = 0.0,
     max_line_size: usize = 10 * 1024 * 1024,
     max_tokenizer_file_size: usize = 1024 * 1024 * 1024,
-    checkpoint_version: u32 = 7,
+    checkpoint_version: u32 = 8,
     reasoning_cycles: usize = 1,
     fnds_max_depth: usize = 6,
     fnds_branching: usize = 4,
@@ -174,6 +174,13 @@ pub const TrainerConfig = struct {
     relational_gpu_columns: usize = 4,
     relational_pass_interval: usize = 50,
     max_knowledge_graph_input: usize = 64 * 1024 * 1024,
+    reconstruction_alpha: f32 = 0.3,
+    phase_a_steps: u64 = 500,
+    phase_b_steps: u64 = 2000,
+    shuffle_target_control: bool = false,
+    target_source_frozen: bool = true,
+    spectral_target_norm: f32 = 0.9,
+    spectral_depth_compensation: bool = true,
 };
 
 pub const TrainerComponents = struct {
@@ -404,6 +411,8 @@ pub const DistributedTrainerFuthark = struct {
     temporal_logical_time: i64,
     training_variable_created: bool,
     vpu_lr_scale: f32,
+    target_source: ?accel.EmbeddingAccelerator,
+    shuffle_control_state: u64,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -475,7 +484,12 @@ pub const DistributedTrainerFuthark = struct {
         const accelerator_ptr = try allocator.create(RSFAccelerator);
         var accelerator_ptr_committed = false;
         errdefer if (!accelerator_ptr_committed) allocator.destroy(accelerator_ptr);
-        accelerator_ptr.* = try RSFAccelerator.initMultiLayer(actual_model_dim, num_layers, allocator);
+        accelerator_ptr.* = try RSFAccelerator.initMultiLayerWithDepthScale(
+            actual_model_dim,
+            num_layers,
+            allocator,
+            config.spectral_depth_compensation,
+        );
         var accelerator_committed = false;
         errdefer if (!accelerator_committed) accelerator_ptr.deinit();
 
@@ -487,6 +501,22 @@ pub const DistributedTrainerFuthark = struct {
         );
         var gpu_embedding_committed = false;
         errdefer if (!gpu_embedding_committed) gpu_embedding.deinit();
+
+        var target_source: ?accel.EmbeddingAccelerator = null;
+        var target_source_committed = false;
+        errdefer if (!target_source_committed) {
+            if (target_source) |*source| source.deinit();
+        };
+        if (config.target_source_frozen) {
+            const frozen_source_flat = try gpu_embedding.readWeightFlat(allocator);
+            defer allocator.free(frozen_source_flat);
+            target_source = try accel.EmbeddingAccelerator.initWithWeights(
+                &accelerator_ptr.ctx,
+                components.tokenizer.next_token_id,
+                actual_model_dim,
+                frozen_source_flat,
+            );
+        }
 
         const crev_kernel_ptr = try allocator.create(ChaosCoreKernel);
         var crev_kernel_ptr_committed = false;
@@ -627,11 +657,15 @@ pub const DistributedTrainerFuthark = struct {
             .temporal_logical_time = 0,
             .training_variable_created = false,
             .vpu_lr_scale = 1.0,
+            .target_source = target_source,
+            .shuffle_control_state = config.embedding_seed ^ 0x5DEECE66D,
         };
+        target_source_committed = true;
 
         trainer.verifyConfigConsistency(components.tokenizer.next_token_id) catch |err| {
             trainer.accelerator.deinit();
             allocator.destroy(trainer.accelerator);
+            if (trainer.target_source) |*source| source.deinit();
             trainer.gpu_embedding.?.deinit();
             trainer.signal_engine.deinit();
             allocator.destroy(trainer.signal_engine);
@@ -736,6 +770,7 @@ pub const DistributedTrainerFuthark = struct {
         self.crev_pipeline.deinit();
         self.crev_kernel.deinit();
         self.allocator.destroy(self.crev_kernel);
+        if (self.target_source) |*source| source.deinit();
         if (self.gpu_embedding) |*emb| emb.deinit();
         self.accelerator.deinit();
         self.allocator.destroy(self.accelerator);
@@ -788,6 +823,23 @@ pub const DistributedTrainerFuthark = struct {
         if (self.gpu_embedding) |*old| old.deinit();
         self.gpu_embedding = new_gpu_embedding;
         self.vocab_size = self.tokenizer.next_token_id;
+
+        if (self.config.target_source_frozen) {
+            const frozen_source_flat = try self.gpu_embedding.?.readWeightFlat(self.allocator);
+            defer self.allocator.free(frozen_source_flat);
+            var new_target_source = try accel.EmbeddingAccelerator.initWithWeights(
+                &self.accelerator.ctx,
+                self.tokenizer.next_token_id,
+                self.model_dim,
+                frozen_source_flat,
+            );
+            errdefer new_target_source.deinit();
+            if (self.target_source) |*old| old.deinit();
+            self.target_source = new_target_source;
+        } else {
+            if (self.target_source) |*old| old.deinit();
+            self.target_source = null;
+        }
     }
 
     fn validateHyperparameters(learning_rate: f32, momentum: f32) TrainerError!void {
@@ -1356,7 +1408,10 @@ pub const DistributedTrainerFuthark = struct {
             }
 
             if (self.coordinator.isRoot() and (self.global_step <= 50 or self.global_step % 10 == 0)) {
-                std.debug.print("[Step {d}] Loss: {d:.6}\n", .{ self.global_step, step_result.loss });
+                std.debug.print(
+                    "[Step {d}] Loss: {d:.6} | Recon: {d:.6} | SourceRMS: {d:.6}\n",
+                    .{ self.global_step, step_result.loss, step_result.reconstruction_loss, step_result.source_rms },
+                );
             }
         }
 
@@ -1473,6 +1528,21 @@ pub const DistributedTrainerFuthark = struct {
                         self.vpu_lr_scale = scale_candidate;
                     }
                 }
+            }
+        }
+
+        if (self.coordinator.world_size > 1) {
+            const world_fraction: f32 = 1.0 / @as(f32, @floatFromInt(self.coordinator.world_size));
+            var shared_scale = [1]f32{self.vpu_lr_scale * world_fraction};
+            self.allReduceFloat32Values(shared_scale[0..]) catch |err| {
+                std.debug.print(
+                    "[Rank {d}] WARN: vpu scale reduction failed: {}\n",
+                    .{ self.coordinator.rank, err },
+                );
+                shared_scale[0] = self.vpu_lr_scale;
+            };
+            if (std.math.isFinite(shared_scale[0]) and shared_scale[0] > 0.0) {
+                self.vpu_lr_scale = @min(2.0, @max(0.5, shared_scale[0]));
             }
         }
 
@@ -1598,6 +1668,8 @@ pub const DistributedTrainerFuthark = struct {
 
     pub const StepResult = struct {
         loss: f32,
+        reconstruction_loss: f32,
+        source_rms: f32,
         sample_weight: f64,
     };
 
@@ -1650,11 +1722,11 @@ pub const DistributedTrainerFuthark = struct {
         try self.coordinator.synchronize();
     }
 
-    fn updateEmbeddingFromInputGradient(
+    fn updateSourceFromInputDelta(
         self: *DistributedTrainerFuthark,
         flat_input_tokens: []const u32,
         real_sequence_lengths: []const usize,
-        input_gradient: *FutharkArray3DF16,
+        input_delta: *FutharkArray3DF16,
         local_fraction: f32,
         learning_rate: f16,
     ) !void {
@@ -1664,7 +1736,7 @@ pub const DistributedTrainerFuthark = struct {
         try embedding.backwardPaddedAccumulate(
             flat_input_tokens,
             real_sequence_lengths,
-            input_gradient,
+            input_delta,
             clip_norm,
         );
         try self.accelerator.sync();
@@ -1707,7 +1779,7 @@ pub const DistributedTrainerFuthark = struct {
             if (list.items.len >= 2) local_active_samples = try std.math.add(u64, local_active_samples, 1);
         }
         const global_active_samples = try self.allReduceSumU64(local_active_samples);
-        if (global_active_samples == 0) return StepResult{ .loss = 0.0, .sample_weight = 0.0 };
+        if (global_active_samples == 0) return StepResult{ .loss = 0.0, .reconstruction_loss = 0.0, .source_rms = 0.0, .sample_weight = 0.0 };
 
         const maximum_sequence_length = try self.getMaximumSequenceLength();
         var local_maximum_prediction_length: u64 = 0;
@@ -1721,7 +1793,7 @@ pub const DistributedTrainerFuthark = struct {
         }
 
         const maximum_prediction_length = try self.allReduceMaximumU64(local_maximum_prediction_length);
-        if (maximum_prediction_length == 0) return StepResult{ .loss = 0.0, .sample_weight = 0.0 };
+        if (maximum_prediction_length == 0) return StepResult{ .loss = 0.0, .reconstruction_loss = 0.0, .source_rms = 0.0, .sample_weight = 0.0 };
         const sequence_length = std.math.cast(usize, maximum_prediction_length) orelse return TrainerError.ValueOverflow;
 
         var local_token_count: u64 = 0;
@@ -1734,7 +1806,7 @@ pub const DistributedTrainerFuthark = struct {
         for (token_lists.items) |list| {
             if (list.items.len >= 2) try active_lists.append(list);
         }
-        if (active_lists.items.len == 0) return StepResult{ .loss = 0.0, .sample_weight = 0.0 };
+        if (active_lists.items.len == 0) return StepResult{ .loss = 0.0, .reconstruction_loss = 0.0, .source_rms = 0.0, .sample_weight = 0.0 };
 
         const effective_batch_size = active_lists.items.len;
         const real_sequence_lengths = try self.allocator.alloc(usize, effective_batch_size);
@@ -1775,10 +1847,25 @@ pub const DistributedTrainerFuthark = struct {
             targets: FutharkArray3DF16,
         };
 
+        if (self.config.shuffle_target_control) {
+            var permute_index: usize = flat_target_tokens.len;
+            while (permute_index > 1) {
+                permute_index -= 1;
+                self.shuffle_control_state = self.shuffle_control_state *% 6364136223846793005 +% 1442695040888963407;
+                const draw: usize = @intCast((self.shuffle_control_state >> 33) % @as(u64, @intCast(permute_index + 1)));
+                const swap = flat_target_tokens[permute_index];
+                flat_target_tokens[permute_index] = flat_target_tokens[draw];
+                flat_target_tokens[draw] = swap;
+            }
+        }
+
         var tensors = if (self.gpu_embedding) |*embedding| embedding_block: {
             var inputs = try embedding.forwardPadded(flat_input_tokens, real_sequence_lengths, sequence_length);
             errdefer inputs.free(&self.accelerator.ctx);
-            const targets = try embedding.forwardPadded(flat_target_tokens, real_sequence_lengths, sequence_length);
+            const targets = if (self.target_source) |*frozen_source|
+                try frozen_source.forwardPadded(flat_target_tokens, real_sequence_lengths, sequence_length)
+            else
+                try embedding.forwardPadded(flat_target_tokens, real_sequence_lengths, sequence_length);
             break :embedding_block BatchTensors{ .inputs = inputs, .targets = targets };
         } else one_hot_block: {
             const batch_rows = try std.math.mul(usize, effective_batch_size, sequence_length);
@@ -1798,14 +1885,14 @@ pub const DistributedTrainerFuthark = struct {
                 const prediction_length = real_sequence_lengths[batch_index];
                 var sequence_index: usize = 0;
                 while (sequence_index < prediction_length) : (sequence_index += 1) {
-                    const input_token: usize = @intCast(token_list.items[sequence_index]);
-                    const target_token: usize = @intCast(token_list.items[sequence_index + 1]);
-                    if (input_token >= self.model_dim or target_token >= self.model_dim) return TrainerError.TokenIndexOutOfRange;
                     const row_index = try std.math.add(
                         usize,
                         try std.math.mul(usize, batch_index, sequence_length),
                         sequence_index,
                     );
+                    const input_token: usize = @intCast(token_list.items[sequence_index]);
+                    const target_token: usize = @intCast(flat_target_tokens[row_index]);
+                    if (input_token >= self.model_dim or target_token >= self.model_dim) return TrainerError.TokenIndexOutOfRange;
                     const base_index = try std.math.mul(usize, row_index, self.model_dim);
                     const input_index = try std.math.add(usize, base_index, input_token);
                     const target_index = try std.math.add(usize, base_index, target_token);
@@ -1839,7 +1926,7 @@ pub const DistributedTrainerFuthark = struct {
             try self.allReduceSumU64(local_token_count)
         else
             local_token_count;
-        if (global_token_count == 0) return StepResult{ .loss = 0.0, .sample_weight = 0.0 };
+        if (global_token_count == 0) return StepResult{ .loss = 0.0, .reconstruction_loss = 0.0, .source_rms = 0.0, .sample_weight = 0.0 };
         const local_fraction: f32 = if (self.coordinator.world_size > 1)
             @floatCast(
                 @as(f64, @floatFromInt(local_token_count)) /
@@ -1868,23 +1955,49 @@ pub const DistributedTrainerFuthark = struct {
             );
         }
 
+        const step_for_phase = self.global_step;
+        const effective_reconstruction_alpha: f32 = blk: {
+            if (self.config.phase_a_steps > 0 and step_for_phase < self.config.phase_a_steps) {
+                break :blk 1.0;
+            }
+            const ramp_span = self.config.phase_b_steps;
+            if (ramp_span == 0) break :blk self.config.reconstruction_alpha;
+            const ramp_end = std.math.add(u64, self.config.phase_a_steps, ramp_span) catch {
+                break :blk self.config.reconstruction_alpha;
+            };
+            if (step_for_phase >= ramp_end) break :blk self.config.reconstruction_alpha;
+            const elapsed = step_for_phase - self.config.phase_a_steps;
+            const progress = @as(f32, @floatFromInt(elapsed)) / @as(f32, @floatFromInt(ramp_span));
+            const value = 1.0 - progress * (1.0 - self.config.reconstruction_alpha);
+            if (!std.math.isFinite(value)) break :blk self.config.reconstruction_alpha;
+            break :blk value;
+        };
+        const clamped_reconstruction_alpha = @max(@as(f32, 0.0), @min(@as(f32, 1.0), effective_reconstruction_alpha));
+        const reconstruction_alpha_f16 = try checkedF32ToF16(clamped_reconstruction_alpha);
+
+        const in_phase_a = self.config.phase_a_steps > 0 and step_for_phase < self.config.phase_a_steps;
+        const forward_scale_value: f32 = if (in_phase_a) 0.0 else 1.0;
+        const forward_scale_f16 = try checkedF32ToF16(forward_scale_value);
+
         var training_result = try self.accelerator.trainingStep(
             &tensors.inputs,
             &tensors.targets,
             real_sequence_lengths,
             learning_rate,
             momentum,
+            reconstruction_alpha_f16,
+            forward_scale_f16,
         );
-        defer training_result.input_gradient.free(&self.accelerator.ctx);
+        defer training_result.input_delta.free(&self.accelerator.ctx);
         try self.accelerator.sync();
 
         const step_backward_ns = std.time.nanoTimestamp() - step_t0_ns;
         if (report_progress) std.debug.print("[Rank 0] Step {d} RSF/OFTB backward complete dt={d}ms\n", .{ completed_step, @divTrunc(step_backward_ns, 1_000_000) });
 
-        try self.updateEmbeddingFromInputGradient(
+        try self.updateSourceFromInputDelta(
             flat_input_tokens,
             real_sequence_lengths,
-            &training_result.input_gradient,
+            &training_result.input_delta,
             local_fraction,
             learning_rate,
         );
@@ -1902,16 +2015,39 @@ pub const DistributedTrainerFuthark = struct {
 
         const local_loss: f32 = @floatCast(training_result.loss);
         if (!std.math.isFinite(local_loss)) return TrainerError.InvalidLoss;
+        const local_reconstruction_loss_raw: f32 = @floatCast(training_result.reconstruction_loss);
+        const local_reconstruction_loss: f32 = if (std.math.isFinite(local_reconstruction_loss_raw))
+            local_reconstruction_loss_raw
+        else
+            0.0;
+
+        var reduced_pair = [2]f32{
+            local_loss * local_fraction,
+            local_reconstruction_loss * local_fraction,
+        };
         var reduced_loss = local_loss;
+        var reduced_reconstruction_loss = local_reconstruction_loss;
         if (self.coordinator.world_size > 1) {
-            var global_loss = [1]f32{local_loss * local_fraction};
-            try self.allReduceFloat32Values(global_loss[0..]);
-            reduced_loss = global_loss[0];
+            try self.allReduceFloat32Values(reduced_pair[0..]);
+            reduced_loss = reduced_pair[0];
+            reduced_reconstruction_loss = reduced_pair[1];
         }
         if (!std.math.isFinite(reduced_loss)) return TrainerError.InvalidLoss;
-        if (report_progress) std.debug.print("[Rank 0] Step {d} complete loss={d:.6}\n", .{ completed_step, reduced_loss });
+        if (!std.math.isFinite(reduced_reconstruction_loss)) reduced_reconstruction_loss = 0.0;
+
+        const local_source_rms: f32 = if (self.gpu_embedding) |*embedding|
+            embedding.sourceRootMeanSquare() catch 0.0
+        else
+            0.0;
+
+        if (report_progress) std.debug.print(
+            "[Rank 0] Step {d} complete loss={d:.6} recon={d:.6} alpha={d:.4} src_rms={d:.6}\n",
+            .{ completed_step, reduced_loss, reduced_reconstruction_loss, clamped_reconstruction_alpha, local_source_rms },
+        );
         return StepResult{
             .loss = reduced_loss,
+            .reconstruction_loss = reduced_reconstruction_loss,
+            .source_rms = local_source_rms,
             .sample_weight = @as(f64, @floatFromInt(local_token_count)),
         };
     }
@@ -2208,6 +2344,26 @@ pub const DistributedTrainerFuthark = struct {
                 try writer.writeByte(0);
             }
 
+            if (self.target_source) |*frozen_source| {
+                try writer.writeByte(1);
+                try writer.writeInt(u64, @as(u64, frozen_source.vocab_size), .little);
+                try writer.writeInt(u64, @as(u64, frozen_source.dim), .little);
+                const frozen_total = frozen_source.vocab_size * frozen_source.dim;
+                const frozen_flat = try self.allocator.alloc(f16, frozen_total);
+                defer self.allocator.free(frozen_flat);
+                if (futhark.futhark_values_f16_2d(self.accelerator.ctx.ctx, frozen_source.weight.arr, @ptrCast(frozen_flat.ptr)) != 0) return TrainerError.CheckpointSaveFailed;
+                try self.accelerator.sync();
+                try writer.writeInt(u64, @as(u64, frozen_total), .little);
+                for (frozen_flat) |value| {
+                    const value_f32: f32 = @floatCast(value);
+                    if (!std.math.isFinite(value_f32)) return TrainerError.InvalidEmbeddingWeight;
+                    _ = try checkedF32ToF16(value_f32);
+                    try writeF32(writer, value_f32);
+                }
+            } else {
+                try writer.writeByte(0);
+            }
+
             try writer.writeAll(self.knowledge_graph_nonce[0..]);
 
             try writeNsirGraph(writer, self.nsir_graph, self.config);
@@ -2423,6 +2579,42 @@ pub const DistributedTrainerFuthark = struct {
             weight_buf_committed = true;
         }
 
+        const has_target_source = try reader.readByte();
+        if (has_target_source > 1) return TrainerError.InvalidCheckpointEmbeddingFlag;
+
+        var pending_target_weight: ?[]f16 = null;
+        var pending_target_vocab: usize = 0;
+        var pending_target_dim: usize = 0;
+        defer if (pending_target_weight) |w| self.allocator.free(w);
+
+        if (has_target_source == 1) {
+            const target_vocab_u64 = try reader.readInt(u64, .little);
+            const target_dim_u64 = try reader.readInt(u64, .little);
+            const target_vocab = std.math.cast(usize, target_vocab_u64) orelse return TrainerError.VocabSizeMismatch;
+            const target_dim = std.math.cast(usize, target_dim_u64) orelse return TrainerError.ModelDimMismatch;
+            if (target_vocab != saved_vocab_size) return TrainerError.VocabSizeMismatch;
+            if (target_dim != self.model_dim) return TrainerError.ModelDimMismatch;
+            if (target_vocab > self.config.max_distributed_integer) return TrainerError.VocabSizeMismatch;
+
+            const target_total = target_vocab * target_dim;
+            const target_len_u64 = try reader.readInt(u64, .little);
+            const target_len = std.math.cast(usize, target_len_u64) orelse return TrainerError.InvalidEmbeddingShape;
+            if (target_len != target_total) return TrainerError.InvalidEmbeddingShape;
+            const target_buf = try self.allocator.alloc(f16, target_len);
+            var target_buf_committed = false;
+            errdefer if (!target_buf_committed) self.allocator.free(target_buf);
+            for (target_buf) |*value| {
+                const v = try readF32(reader);
+                if (!std.math.isFinite(v)) return TrainerError.InvalidEmbeddingWeight;
+                if (v < -65504.0 or v > 65504.0) return TrainerError.InvalidEmbeddingWeight;
+                value.* = @floatCast(v);
+            }
+            pending_target_weight = target_buf;
+            pending_target_vocab = target_vocab;
+            pending_target_dim = target_dim;
+            target_buf_committed = true;
+        }
+
         var loaded_nonce: [32]u8 = undefined;
         try reader.readNoEof(loaded_nonce[0..]);
 
@@ -2471,11 +2663,17 @@ pub const DistributedTrainerFuthark = struct {
         try new_tokenizer.loadVocab(tokenizer_tmp);
         if (new_tokenizer.next_token_id != saved_vocab_size) return TrainerError.VocabSizeMismatch;
         if (pending_emb_weight != null and pending_emb_vocab != new_tokenizer.next_token_id) return TrainerError.VocabSizeMismatch;
+        if (pending_target_weight != null and pending_target_vocab != new_tokenizer.next_token_id) return TrainerError.VocabSizeMismatch;
 
         var new_accelerator_ptr = try self.allocator.create(RSFAccelerator);
         var new_accelerator_ptr_committed = false;
         errdefer if (!new_accelerator_ptr_committed) self.allocator.destroy(new_accelerator_ptr);
-        new_accelerator_ptr.* = try RSFAccelerator.initMultiLayer(self.model_dim, self.num_layers, self.allocator);
+        new_accelerator_ptr.* = try RSFAccelerator.initMultiLayerWithDepthScale(
+            self.model_dim,
+            self.num_layers,
+            self.allocator,
+            self.config.spectral_depth_compensation,
+        );
         var new_accelerator_committed = false;
         errdefer if (!new_accelerator_committed) new_accelerator_ptr.deinit();
 
@@ -2502,6 +2700,20 @@ pub const DistributedTrainerFuthark = struct {
             );
         }
 
+        var loaded_target_source: ?accel.EmbeddingAccelerator = null;
+        var loaded_target_source_committed = false;
+        errdefer if (!loaded_target_source_committed) {
+            if (loaded_target_source) |*source| source.deinit();
+        };
+        if (pending_target_weight) |target_f16| {
+            loaded_target_source = try accel.EmbeddingAccelerator.initWithWeights(
+                &new_accelerator_ptr.ctx,
+                pending_target_vocab,
+                pending_target_dim,
+                target_f16,
+            );
+        }
+
         var new_signal_engine_ptr = try self.allocator.create(SignalPropagationEngine);
         var new_signal_engine_ptr_committed = false;
         errdefer if (!new_signal_engine_ptr_committed) self.allocator.destroy(new_signal_engine_ptr);
@@ -2522,6 +2734,10 @@ pub const DistributedTrainerFuthark = struct {
         if (self.gpu_embedding) |*old_emb| old_emb.deinit();
         self.gpu_embedding = loaded_gpu_embedding;
         loaded_gpu_embedding_committed = true;
+
+        if (self.target_source) |*old_source| old_source.deinit();
+        self.target_source = loaded_target_source;
+        loaded_target_source_committed = true;
 
         self.accelerator.deinit();
         self.allocator.destroy(self.accelerator);
@@ -2583,6 +2799,7 @@ pub const DistributedTrainerFuthark = struct {
         self.global_step = saved_global_step;
         self.training_variable_created = false;
         self.vpu_lr_scale = 1.0;
+        self.shuffle_control_state = self.config.embedding_seed ^ 0x5DEECE66D ^ saved_global_step;
         self.knowledge_graph_nonce = loaded_nonce;
 
         self.freeLayerSnapshots(snapshots);
