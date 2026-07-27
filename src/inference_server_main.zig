@@ -9,14 +9,14 @@ pub fn main() !void {
 
     var config = ServerConfig{
         .port = 8080,
-        .host = "0.0.0.0",
+        .host = "127.0.0.1",
         .max_connections = 100,
         .request_timeout_ms = 30000,
         .batch_size = 32,
         .model_path = null,
         .rate_limit_per_minute = 60,
         .max_request_size_bytes = 1024 * 1024,
-        .require_api_key = false,
+        .require_api_key = true,
     };
 
     const args = try std.process.argsAlloc(allocator);
@@ -36,14 +36,20 @@ pub fn main() !void {
             config.model_path = args[i];
         } else if (std.mem.eql(u8, arg, "--require-api-key")) {
             config.require_api_key = true;
+        } else if (std.mem.eql(u8, arg, "--allow-anonymous")) {
+            config.require_api_key = false;
+        } else if (std.mem.eql(u8, arg, "--dataset") and i + 1 < args.len) {
+            i += 1;
+            config.dataset_path = args[i];
         } else if (std.mem.eql(u8, arg, "--help")) {
             std.debug.print("JAIDE Inference Server\n\n", .{});
             std.debug.print("Options:\n", .{});
             std.debug.print("  --port <port>       Port to listen on (default: 8080)\n", .{});
-            std.debug.print("  --host <host>       Host to bind to (default: 0.0.0.0)\n", .{});
+            std.debug.print("  --host <host>       Host to bind to (default: 127.0.0.1)\n", .{});
             std.debug.print("  --model <path>      Path to model file\n", .{});
             std.debug.print("  --dataset <path>    Path to dataset file\n", .{});
-            std.debug.print("  --require-api-key   Require API key for requests\n", .{});
+            std.debug.print("  --require-api-key   Require API key for requests (default: on)\n", .{});
+            std.debug.print("  --allow-anonymous   Disable API key requirement\n", .{});
             std.debug.print("  --help              Show this help message\n", .{});
             return;
         }

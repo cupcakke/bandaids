@@ -798,7 +798,7 @@ def run_gpu_train_and_infer(
         srv_log_path = report_dir / "phase_d_server.log"
         srv_f = open(srv_log_path, "w")
         srv_proc = subprocess.Popen(
-            [str(inference_bin), "--port", "8080", "--host", "127.0.0.1"],
+            [str(inference_bin), "--port", "8080", "--host", "127.0.0.1", "--allow-anonymous"],
             cwd=project_dir,
             env=inf_env,
             stdout=srv_f,
@@ -869,6 +869,19 @@ def run_gpu_train_and_infer(
                 except Exception:
                     pass
 
+                generated_tokens: List[int] = []
+                generated_text_value = ""
+                if isinstance(parsed, dict):
+                    raw_tokens = parsed.get("tokens")
+                    if isinstance(raw_tokens, list):
+                        generated_tokens = [t for t in raw_tokens if isinstance(t, int)]
+                    raw_text = parsed.get("text")
+                    if isinstance(raw_text, str):
+                        generated_text_value = raw_text
+
+                distinct_tokens = len(set(generated_tokens))
+                non_reserved = [t for t in generated_tokens if t >= 4]
+
                 result["phases"]["D_inference"] = {
                     "returncode": rc_i,
                     "duration_s": round(inference_duration, 2),
@@ -878,6 +891,14 @@ def run_gpu_train_and_infer(
                     "response_parsed": parsed,
                     "server_up": True,
                     "model_path": model_path,
+                    "generated_token_count": len(generated_tokens),
+                    "generated_distinct_tokens": distinct_tokens,
+                    "generated_non_reserved_count": len(non_reserved),
+                    "generated_text_length": len(generated_text_value),
+                    "generation_produced_output": len(generated_tokens) > 0,
+                    "generation_is_degenerate": (
+                        len(generated_tokens) > 1 and distinct_tokens <= 1
+                    ),
                 }
                 _write_report(report_dir, "phase_d_inference.log", out_i)
         finally:
