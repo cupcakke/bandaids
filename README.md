@@ -8,7 +8,7 @@ RSF is not built on that primitive. Its atomic operation is a bijective, inverti
 
 The analogy to 2017 is deliberate. Attention Is All You Need took attention out of the encoder-decoder RNN context where it had lived as an auxiliary mechanism and made it the sole primitive. RSF does the same thing to affine coupling: it takes the coupling layer out of the normalizing-flow context, where it existed to make density estimation tractable, and makes it the entire network. This is not a wrapper. RevNet and Reformer are reversibility retrofitted onto existing architectures and still contain convolutions or attention underneath. RSF contains neither.
 
-This repository is the full system built on that primitive, written from scratch in Zig, with GPU kernels in Futhark, hardware models in Clash Haskell, a machine-checked proof of the core invertibility theorem in Lean 4, and a zero-knowledge inference circuit in Circom. No PyTorch, no TensorFlow, no Zig package dependencies.
+This repository is the full system built on that primitive, written from scratch in Zig, with GPU kernels in Futhark, hardware models in Clash Haskell, a machine-checked proof of the core invertibility theorem in Lean 4, and a zero-knowledge inference circuit in Circom. No PyTorch, no TensorFlow, and no Zig package dependencies; the only external package is diku-dk/sorts on the Futhark side.
 
 
 Why the primitive is different
@@ -80,23 +80,33 @@ Because RSF is bijective, the backward pass produces a second quantity at no ext
 
 So a single forward and backward pair carries three independent signals rather than one.
 
-The forward signal is the ordinary next-token prediction loss. This is the only one a conventional architecture can extract.
+The forward signal is the discrepancy between the flow output and the target position representation. Targets are produced by a separate frozen source table rather than by the trainable one, so driving the trainable table toward zero does not drive the objective toward zero; without that separation the whole objective has a trivial global minimum at collapse. This signal is the only one a conventional architecture can extract.
 
 The reconstruction signal is the discrepancy between the recovered input and the true input:
 
     L_recon = (1/N) * sum_i || x_hat_i - x_i ||^2
 
-This measures how well the weight matrices actually preserve information, which is to say how genuinely invertible the network is at its current weights. Its computational cost is zero, because x_hat is already sitting in the backward buffers.
+This measures how well the matrices actually preserve information, which is to say how genuinely invertible the stack is at its current parameters. It costs one additional kernel call per step and no additional stack traversal, because x_hat is already sitting in the backward buffers when the loop terminates. It is computed by batch_compute_reconstruction_loss_masked in main.fut and reported on every logged step.
 
-The combined embedding signal weights the two together when updating the embedding table:
+The combined signal weights the two together when updating the source table:
 
-    grad_emb = grad_fwd + alpha * grad_recon
+    delta_src = forward_scale * delta_fwd + alpha * 2 * (x_hat - x) / valid_count
 
-The embedding therefore learns two things at once: how to predict, and how to carry information through the stack without losing it.
+batch_add_reconstruction_delta_masked applies this fusion on device, in f32, with padding positions masked out and the result saturated to the representable f16 range. The source table therefore learns two things at once: how to predict, and how to carry information through the stack without losing it.
 
 This is only available because the inverse is exact. In a transformer, intermediate activations recovered during the backward pass are either values cached from the forward pass or approximations reassembled from them, and they do not correspond to the original input under any interpretation. In RSF the backward pass applies the true inverse, so the reconstruction is the input, and the reconstruction loss is a real geometric measure of whether the weights preserve the structure of what was fed in.
 
-The practical effect is gradient density. The embedding and the early layers receive feedback from two directions on every step, for the same arithmetic, giving roughly two to three times the signal per unit of computation. A phased curriculum exploits this by starting with the reconstruction term alone, at alpha equal to one, so the weight matrices become well conditioned first, then folding in the forward term progressively. That ordering avoids the failure mode where a network learns from incoherent prediction gradients while its weights are still badly conditioned.
+The practical effect is signal density. The source table and the early positions in the stack receive feedback from two directions on every step, for one extra kernel call. A phased curriculum exploits this and is implemented in trainStepFuthark. Phase A runs for phase_a_steps with alpha at one and forward_scale at zero, so the matrices become well conditioned under the reconstruction term alone; the forward term is suppressed inside the fusion kernel rather than discarded afterwards. Phase B ramps alpha linearly from one down to reconstruction_alpha across phase_b_steps while forward_scale is one. Every step after that holds alpha at reconstruction_alpha. The defaults are five hundred, two thousand and 0.3, overridable through JAIDE_PHASE_A_STEPS, JAIDE_PHASE_B_STEPS and JAIDE_RECONSTRUCTION_ALPHA. That ordering avoids the failure mode where the stack learns from incoherent prediction signal while its matrices are still badly conditioned.
+
+Two measurement controls ship alongside it, because a falling curve is not by itself evidence of learning. Setting JAIDE_SHUFFLE_TARGET_CONTROL permutes the target positions within the step, which destroys the input-to-target correspondence while leaving every tensor shape and the entire code path identical; a run whose forward curve is unchanged under that permutation is not learning from the data. Separately, the root-mean-square of the source table is reported on every logged step as SourceRMS, because a forward curve that falls while SourceRMS falls with it indicates collapse toward the zero representation rather than convergence.
+
+Measurement status
+
+What is verified and what is merely implemented are different claims, so they are separated here.
+
+Verified. The invertibility round trip passes empirically at a tolerance of 1e-4, and the OFTB block carries a machine-checked Lean 4 proof over an abstract scale algebra. The build produces both binaries, the full stack runs distributed on B200 hardware through the Modal harness, and the 359 inline test blocks run in continuous integration on every push.
+
+Not yet established. No convergence claim is supported at the time of writing. The first end-to-end training run was a twelve-minute smoke test over five thousand samples whose objective admitted a trivial minimum, because targets were drawn from the same trainable table as inputs; its curve settled within two percent of the value a constant zero output would produce and is therefore evidence of collapse rather than of learning. That defect is fixed by the frozen target source described above, and the initialization is now scaled by one over the square root of the depth so that a stack of many positions is not contracting before the first step, but no run has yet been made under the corrected configuration. Until a run completes with the shuffled-target control alongside it, and the forward curve separates from that control while SourceRMS holds steady, this repository demonstrates an architecture and an infrastructure, not a trained model. No perplexity, no downstream benchmark and no comparison against a baseline is claimed.
 
 Architecture summary
 
@@ -111,6 +121,9 @@ Architecture summary
     context        versioned temporal graph plus surprise memory
     symbolic       NSIR relational graph, five-state edge quality
     training       triple signal: forward loss, reconstruction, combined
+    curriculum     phase A pure reconstruction, phase B ramp, then steady
+    targets        frozen source table, separate from the trainable one
+    controls       shuffled-target baseline, per-step source RMS reporting
     verification   Lean 4 proof, Circom ZK circuit, 359 test blocks
 
 Absent by construction: MLP, ReLU, LayerNorm, BatchNorm, softmax, self-attention, convolution, pooling, recurrence, hidden state, KV cache, separate bias tensor, stored activations.
@@ -118,8 +131,8 @@ Absent by construction: MLP, ReLU, LayerNorm, BatchNorm, softmax, self-attention
 
 Repository layout
 
-    build.zig.txt          build script, rename to build.zig
-    build.zig.zon.txt      package manifest, rename to build.zig.zon
+    build.zig              build script
+    build.zig.zon          package manifest
     scripts/
       modal_status_bench.py   end-to-end Modal harness: build, train, serve
       setup_modal_token.sh    credential sanitizer for the Modal CLI
@@ -131,7 +144,7 @@ Repository layout
       tokenizer/           MGT morphological and BPE tokenizer
       index/               SSI hash-partitioned segment index
       ranker/              relevance scoring over SSI results
-      core_relational/     26-module relational graph substrate
+      core_relational/     25-module relational graph substrate
       hw/accel/            CUDA and Futhark bindings, kernels, fractal LPU
       hw/rtl/              Clash hardware models and software simulator
       distributed/         NCCL coordinator, GPU trainer, Modal client
@@ -140,17 +153,15 @@ Repository layout
       zk/                  Circom inference-trace circuit
       tests/               benchmarks, refcount stress test, C ABI test
 
-The system spans 57 Zig sources, two Futhark kernel libraries, one Circom circuit, one Lean proof, three Clash hardware modules, two Python deployment scripts and one C ABI test.
+The system spans 73 Zig sources, of which 56 are implementation modules and 17 are test entry points, alongside two Futhark kernel libraries, one Circom circuit, one Lean proof, three Clash hardware modules, three Python deployment scripts and one C ABI test.
 
 
 Building
 
-Zig 0.14.1 and Futhark 0.26.4 are required for any build. CUDA 12.8 with NCCL is needed for the gpu flag, circom 2.1.8 with snarkjs for zk, Lean 4 with lake for verify, and GHC with Clash for rtl.
+Zig 0.14.1 and Futhark 0.26.4 are required for any build. Continuous integration pins both, type-checks each Futhark source, verifies formatting, builds the server and runs the full test suite on every push. CUDA 12.8 with NCCL is needed for the gpu flag, circom 2.1.8 with snarkjs for zk, Lean 4 with lake for verify, and GHC with Clash for rtl.
 
-The build files carry a text suffix so the toolchain does not pick them up until renamed. After renaming and syncing the single Futhark package dependency, a default build produces the inference server:
+After syncing the single Futhark package dependency, a default build produces the inference server:
 
-    mv build.zig.txt build.zig
-    mv build.zig.zon.txt build.zig.zon
     cd src/hw/accel && futhark pkg sync && cd -
     zig build -Doptimize=ReleaseSafe
 
@@ -228,7 +239,7 @@ The ranker scores candidates from that index. The final score blends three signa
 
 The relational layer
 
-This is the symbolic half of the dual system. Twenty-six modules hold, transform, verify and remember relational structure while the RSF stack does the numerics. Everything is exposed through mod.zig, a facade that imports all twenty-four submodules with public declarations and then lifts several hundred individual types into the top namespace, so calling code writes core_relational.SelfSimilarRelationalGraph without knowing which file it lives in. Where two modules define the same name the facade disambiguates: ProcessingCore becomes ChaosProcessingCore and RGPUProcessingCore, CoreState splits the same way, SystemState becomes SystemState and SecuritySystemState, QuantumCircuit becomes QuantumCircuit and HardwareQuantumCircuit, VerificationResult becomes FormalVerificationResult, Term becomes TypeTheoryTerm. The C entry points are re-exported here too, which means the entire relational engine is reachable over FFI from Python, Rust or C++. The single test in the facade is the only place in the codebase where ZRuntime and ChaosCoreKernel appear together, creating two variables, entangling them, then allocating and reading back a memory block, so it validates the integration seam rather than any one module.
+This is the symbolic half of the dual system. Twenty-five modules hold, transform, verify and remember relational structure while the RSF stack does the numerics. Everything is exposed through mod.zig, a facade that imports all twenty-four submodules with public declarations and then lifts several hundred individual types into the top namespace, so calling code writes core_relational.SelfSimilarRelationalGraph without knowing which file it lives in. Where two modules define the same name the facade disambiguates: ProcessingCore becomes ChaosProcessingCore and RGPUProcessingCore, CoreState splits the same way, SystemState becomes SystemState and SecuritySystemState, QuantumCircuit becomes QuantumCircuit and HardwareQuantumCircuit, VerificationResult becomes FormalVerificationResult, Term becomes TypeTheoryTerm. The C entry points are re-exported here too, which means the entire relational engine is reachable over FFI from Python, Rust or C++. The single test in the facade is the only place in the codebase where ZRuntime and ChaosCoreKernel appear together, creating two variables, entangling them, then allocating and reading back a memory block, so it validates the integration seam rather than any one module.
 
 nsir_core: the substrate
 
@@ -348,7 +359,7 @@ Edges are not simple weighted links across this boundary either: weight is clamp
 
 The optimizer implemented here is an adaptive simulated annealer whose energy sums weight times fractal dimension across edges, correlation magnitudes and node amplitudes using Kahan accumulation for numerical stability. Perturbation randomly adjusts edge weights and node states, acceptance follows the Metropolis rule, stagnation triggers automatic reheating, and the cooling rate adapts to the observed acceptance rate.
 
-Two functions form the data gateway: encoding takes raw bytes and returns a node identifier, decoding returns the payload, and together they replace what an embedding lookup table does in a conventional model. Nineteen negative error codes cover null pointers, allocation failure, missing nodes and edges, invalid quality, optimization failure, invalid strings, duplicates, invalid parameters, math errors, uninitialized state, self-reference, invalid state, threading and unknown gates.
+Two functions form the data gateway: encoding takes raw bytes and returns a node identifier, decoding returns the payload, and together they replace what an embedding lookup table does in a conventional model. Eighteen negative error codes cover null pointers, allocation failure, missing nodes and edges, invalid quality, optimization failure, invalid strings, duplicates, invalid parameters, math errors, uninitialized state, self-reference, invalid state, threading and unknown gates.
 
 temporal_graph: what replaces the context window
 
@@ -559,7 +570,7 @@ cuda_bindings.zig declares two parallel structs and selects at compile time, usi
 
 accel_interface.zig wraps this in typed handles and an RSFAccelerator mirroring the model on device. It configures Futhark with group size 256, 128 groups and tile size 32, and reads JAIDE_FUTHARK_CACHE to persist NVRTC kernels across container starts, warning when unset, at lines 53 to 56. Raw f16 device pointers are exposed so NCCL can all-reduce gradients in place. setClipRange rejects any range other than minus five to five when GPU is on, because the compiled kernel bakes that constant in.
 
-futhark_kernels.fut, compiled for CPU in f32, exposes roughly a hundred entries covering matmul, Fisher and natural gradient updates, RSF forward and backward, the scatter permutation, SSI hashing and search, LSH, and a large family of relational graph kernels. main.fut, compiled for CUDA in f16, provides a fused training step, padded and masked batch operations, OFTB, embedding forward, backward, update and spectral normalization, and graph_batch_encode which feeds bulkImportFromGPU.
+futhark_kernels.fut, compiled for CPU in f32, exposes seventy-six entries covering matmul, Fisher and natural gradient updates, RSF forward and backward, the scatter permutation, SSI hashing and search, LSH, and a large family of relational graph kernels. main.fut, compiled for CUDA in f16, provides a fused training step, padded and masked batch operations, OFTB, embedding forward, backward, update and spectral normalization, and graph_batch_encode which feeds bulkImportFromGPU.
 
 fractal_lpu.zig partitions memory as a self-similar quadtree rather than a flat pool, matching the fractal structure of the graph it serves. Each tile owns a base address, a size, up to four children and a compute unit array sized two to the power of its level capped at six, with coherence decaying by a factor of 0.9 at each level down. Subdivision stops on any of four conditions: the tile is at or below the minimum size, the level has reached the box-counting limit, there are fewer than four child slots, or a quarter-sized child would fall below the minimum. Mapping a graph node into a tile clamps its weight, records it in the tile's entanglement map, and increments the pending operation count on the compute unit chosen by hash. Load balancing caps any unit exceeding the average by more than the balance factor. Fixed-point execution converts coherence into a Q16.16 scale, distributes the input across compute units, and saturates explicitly at the signed 32-bit bounds rather than wrapping. Defaults are a Hausdorff dimension of 1.5, four box-counting levels, a 4096-byte minimum tile and a coherence threshold of 0.7.
 
@@ -585,9 +596,11 @@ The server is where the two halves of the system meet in one process. Its state 
 
 Three endpoints are served. A GET to /v1/health returns a status string, uptime in seconds, whether a model is loaded and a version. A POST to /v1/inference takes a text field and a token budget and returns the generated token ids, optionally the decoded text, the input tokens, embeddings, and the processing time in milliseconds. A POST to /v1/batch_inference takes a list of texts and runs them through the same path.
 
+Generation reads the flow. Each step gathers the trailing context position from the source table into a buffer of width dim times two, runs the full stack forward over it, and then selects the next position by cosine similarity between the resulting flow state and every row of the source table, skipping the four reserved ids. Because the primitive is a bijection from a space onto itself rather than a map onto a vocabulary simplex, the source table is reused as the readout rather than introducing a separate projection, which would add parameters outside the coupling algebra. The selected position is appended and fed back on the next step. The relational subsystems observe this loop: the flow state is encoded into the NSIR graph on every step, and the segment index records the emitted position, but neither substitutes for the flow when the stack is available. One consequence is worth stating plainly, since the readout is exhaustive over the table: selection costs vocabulary times width multiply-accumulate operations per emitted position, which is acceptable for short completions and is the obvious place to add an approximate nearest-position index before long-form generation.
+
 Connections are handled by a thread pool sized from num_worker_threads, defaulting to four. Each accepted socket gets a keep-alive timeout, defaulting to five seconds, applied directly to the socket, and the handler loop reads the connection header to decide whether to serve another request on the same socket or close. Rate limiting keys a map of timestamp logs by client address over a sixty second window, with a map-level mutex and a per-entry mutex so two clients never serialize against each other. When require_api_key is set the server reads JAIDE_API_KEY from the environment and compares it against the authorization header on every request.
 
-One configuration detail deserves attention before deployment. The ServerConfig struct defaults to binding 127.0.0.1, ten requests per minute, a sixteen megabyte body cap and API keys required. The main function overrides all four, to 0.0.0.0, sixty per minute, one megabyte and keys off. The shipped binary therefore listens on every interface with authentication disabled unless the operator passes the flag explicitly. The command line accepts port, host, model and require-api-key options; the help text also lists a dataset option that is never parsed, and JAIDE_MODEL_PATH fills the model path only when the flag was absent.
+The ServerConfig struct defaults to binding 127.0.0.1, ten requests per minute, a sixteen megabyte body cap and API keys required. The main function raises the rate limit to sixty per minute and lowers the body cap to one megabyte, but leaves the bind address and the authentication requirement at their safe defaults, so the shipped binary is loopback-only and authenticated unless the operator opts out. Exposing it requires passing host explicitly, and disabling authentication requires the separate allow-anonymous flag. The command line accepts port, host, model, dataset, require-api-key and allow-anonymous options, and JAIDE_MODEL_PATH fills the model path only when the flag was absent.
 
 
 Formal verification
@@ -612,6 +625,11 @@ The hard part of the circuit is the exponential. The RSF scale is an exponential
 Around it sit the supporting templates: signed absolute value, division by a constant, Poseidon commitment and chaining, Merkle proof verification, range proofs, batch inference verification, a noise bound check that verifies every coordinate of a perturbation stays under a limit, aggregation verification, a differential privacy proof and a secure aggregation proof across participants.
 
 FullInferenceProof composes them into the top level. It takes the input tokens, the per-layer weight matrices, an expected output, input and output commitments, a commitment per layer and a maximum squared error. It hashes the input through a Poseidon chain and checks it against the supplied commitment, threads the tokens through every layer in sequence carrying the intermediate outputs, checks each layer against its own commitment, and folds all the per-layer validity flags into a single output by multiplication, so one failure anywhere zeroes the result. The instantiated main component is eight layers at dimension thirty-two with sixty-four precision bits, declaring the tokens, expected output and both commitments public.
+
+
+Licence
+
+MIT. See LICENSE.
 
 
 by Kollár Jade

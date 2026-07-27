@@ -35,6 +35,8 @@ const SecurityProofEngine = core_relational.SecurityProofEngine;
 const QuantumTaskAdapter = core_relational.QuantumTaskAdapter;
 const QuantumSubgraph = core_relational.QuantumSubgraph;
 
+const RESERVED_TOKEN_COUNT: usize = 4;
+
 pub const ServerConfig = struct {
     port: u16 = 8080,
     host: []const u8 = "127.0.0.1",
@@ -42,6 +44,7 @@ pub const ServerConfig = struct {
     request_timeout_ms: u64 = 30000,
     batch_size: usize = 32,
     model_path: ?[]const u8 = null,
+    dataset_path: ?[]const u8 = null,
     rate_limit_per_minute: u32 = 10,
     max_request_size_bytes: usize = 16 * 1024 * 1024,
     require_api_key: bool = true,
@@ -473,7 +476,17 @@ pub const InferenceServer = struct {
 
         const dim = if (self.model.?.rsf) |rsf| (rsf.ctrl orelse return).dim else 256;
 
-        self.embedding = try LearnedEmbedding.init(self.allocator, 50000, dim, 42);
+        const source_vocab_size: usize = blk: {
+            if (self.model.?.mgt) |mgt| {
+                const tokenizer_vocab = mgt.vocabSize();
+                if (tokenizer_vocab > 0) break :blk tokenizer_vocab;
+            }
+            const metadata_vocab = self.model.?.metadata.mgt_vocab_size;
+            if (metadata_vocab > 0) break :blk metadata_vocab;
+            break :blk 50000;
+        };
+
+        self.embedding = try LearnedEmbedding.init(self.allocator, source_vocab_size, dim * 2, 42);
 
         self.nsir_graph = try SelfSimilarRelationalGraph.init(self.allocator);
         self.chaos_kernel = ChaosCoreKernel.init(self.allocator);
@@ -1127,30 +1140,35 @@ pub const InferenceServer = struct {
         while (gen_step < max_new_tokens) : (gen_step += 1) {
             var next_token: u32 = 0;
 
-            if (self.model.?.rsf != null) {
+            if (self.model.?.rsf != null and self.embedding != null) {
                 const dim = (self.model.?.rsf.?.ctrl orelse break).dim;
+                const flow_width = dim * 2;
 
-                var step_emb = if (self.embedding) |*emb|
-                    emb.forward(allocator, generated.items, generated.items.len) catch null
-                else
-                    null;
+                const context_start = if (generated.items.len > 0) generated.items.len - 1 else 0;
+                const context_tokens = generated.items[context_start..];
+
+                var step_emb = self.embedding.?.forward(allocator, context_tokens, context_tokens.len) catch null;
                 defer if (step_emb) |*t| t.deinit();
 
                 if (step_emb) |et| {
-                    var step_tensor = blk: {
-                        var t = Tensor.init(allocator, &.{ 1, dim * 2 }) catch break;
-                        const copy_len = @min(et.data.len, t.data.len);
-                        @memcpy(t.data[0..copy_len], et.data[0..copy_len]);
-                        if (copy_len < t.data.len) @memset(t.data[copy_len..], 0.0);
-                        break :blk t;
-                    };
+                    var step_tensor = Tensor.init(allocator, &.{ 1, flow_width }) catch break;
                     defer step_tensor.deinit();
 
-                    self.model.?.rsf.?.forward(&step_tensor) catch {};
+                    const row_start = if (et.data.len >= flow_width) et.data.len - flow_width else 0;
+                    const source_row = et.data[row_start..];
+                    const copy_len = @min(source_row.len, flow_width);
+                    @memcpy(step_tensor.data[0..copy_len], source_row[0..copy_len]);
+                    if (copy_len < flow_width) @memset(step_tensor.data[copy_len..], 0.0);
 
-                    if (self.nsir_graph) |*graph| {
-                        const tensor_bytes = std.mem.sliceAsBytes(step_tensor.data);
-                        _ = graph.encodeInformation(tensor_bytes) catch {};
+                    const forward_ok = if (self.model.?.rsf.?.forward(&step_tensor)) |_| true else |_| false;
+
+                    if (forward_ok) {
+                        if (self.nsir_graph) |*graph| {
+                            const tensor_bytes = std.mem.sliceAsBytes(step_tensor.data);
+                            _ = graph.encodeInformation(tensor_bytes) catch {};
+                        }
+
+                        next_token = self.selectTokenFromFlowState(step_tensor.data) catch 0;
                     }
                 }
             }
@@ -1437,30 +1455,35 @@ pub const InferenceServer = struct {
             while (gen_step < max_gen_tokens) : (gen_step += 1) {
                 var next_token: u32 = 0;
 
-                if (self.model.?.rsf != null) {
+                if (self.model.?.rsf != null and self.embedding != null) {
                     const dim = (self.model.?.rsf.?.ctrl orelse break).dim;
+                    const flow_width = dim * 2;
 
-                    var step_emb = if (self.embedding) |*emb|
-                        emb.forward(allocator, generated.items, generated.items.len) catch null
-                    else
-                        null;
+                    const context_start = if (generated.items.len > 0) generated.items.len - 1 else 0;
+                    const context_tokens = generated.items[context_start..];
+
+                    var step_emb = self.embedding.?.forward(allocator, context_tokens, context_tokens.len) catch null;
                     defer if (step_emb) |*t| t.deinit();
 
                     if (step_emb) |et| {
-                        var step_tensor = blk: {
-                            var t = Tensor.init(allocator, &.{ 1, dim * 2 }) catch break;
-                            const copy_len = @min(et.data.len, t.data.len);
-                            @memcpy(t.data[0..copy_len], et.data[0..copy_len]);
-                            if (copy_len < t.data.len) @memset(t.data[copy_len..], 0.0);
-                            break :blk t;
-                        };
+                        var step_tensor = Tensor.init(allocator, &.{ 1, flow_width }) catch break;
                         defer step_tensor.deinit();
 
-                        self.model.?.rsf.?.forward(&step_tensor) catch {};
+                        const row_start = if (et.data.len >= flow_width) et.data.len - flow_width else 0;
+                        const source_row = et.data[row_start..];
+                        const copy_len = @min(source_row.len, flow_width);
+                        @memcpy(step_tensor.data[0..copy_len], source_row[0..copy_len]);
+                        if (copy_len < flow_width) @memset(step_tensor.data[copy_len..], 0.0);
 
-                        if (self.nsir_graph) |*graph| {
-                            const tensor_bytes = std.mem.sliceAsBytes(step_tensor.data);
-                            _ = graph.encodeInformation(tensor_bytes) catch {};
+                        const forward_ok = if (self.model.?.rsf.?.forward(&step_tensor)) |_| true else |_| false;
+
+                        if (forward_ok) {
+                            if (self.nsir_graph) |*graph| {
+                                const tensor_bytes = std.mem.sliceAsBytes(step_tensor.data);
+                                _ = graph.encodeInformation(tensor_bytes) catch {};
+                            }
+
+                            next_token = self.selectTokenFromFlowState(step_tensor.data) catch 0;
                         }
                     }
                 }
@@ -1592,6 +1615,61 @@ pub const InferenceServer = struct {
         try rwriter.writeAll(json);
 
         _ = stream.writeAll(response_buf.items) catch {};
+    }
+
+    fn selectTokenFromFlowState(self: *InferenceServer, flow_state: []const f32) !u32 {
+        if (self.embedding == null) return 0;
+        const source = &self.embedding.?;
+        const width = source.dim;
+        if (width == 0 or flow_state.len < width) return 0;
+        if (source.vocab_size <= RESERVED_TOKEN_COUNT) return 0;
+
+        const state_row = flow_state[0..width];
+        var state_norm_sq: f64 = 0.0;
+        for (state_row) |value| {
+            if (!std.math.isFinite(value)) return 0;
+            state_norm_sq += @as(f64, value) * @as(f64, value);
+        }
+        if (!(state_norm_sq > 0.0)) return 0;
+        const state_norm = @sqrt(state_norm_sq);
+
+        var best_token: u32 = 0;
+        var best_similarity: f64 = -std.math.inf(f64);
+        var found_candidate = false;
+
+        var token_index: usize = RESERVED_TOKEN_COUNT;
+        while (token_index < source.vocab_size) : (token_index += 1) {
+            const row_start = token_index * width;
+            const row_end = row_start + width;
+            if (row_end > source.weight.data.len) break;
+            const candidate_row = source.weight.data[row_start..row_end];
+
+            var dot: f64 = 0.0;
+            var candidate_norm_sq: f64 = 0.0;
+            var row_finite = true;
+            for (candidate_row, 0..) |value, position| {
+                if (!std.math.isFinite(value)) {
+                    row_finite = false;
+                    break;
+                }
+                const promoted: f64 = @floatCast(value);
+                dot += promoted * @as(f64, state_row[position]);
+                candidate_norm_sq += promoted * promoted;
+            }
+            if (!row_finite) continue;
+            if (!(candidate_norm_sq > 0.0)) continue;
+
+            const similarity = dot / (state_norm * @sqrt(candidate_norm_sq));
+            if (!std.math.isFinite(similarity)) continue;
+            if (similarity > best_similarity) {
+                best_similarity = similarity;
+                best_token = @intCast(token_index);
+                found_candidate = true;
+            }
+        }
+
+        if (!found_candidate) return 0;
+        return best_token;
     }
 
     fn sendError(self: *InferenceServer, stream: net.Stream, message: []const u8, status_code: u16) !void {

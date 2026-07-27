@@ -1,6 +1,7 @@
 import json
 import os
 import selectors
+import sys
 import shutil
 import signal
 import subprocess
@@ -35,18 +36,25 @@ IGNORE_PATTERNS = [
     ".config",
 ]
 
-GPU_SPEC = os.environ.get("JAIDE_BENCH_GPU", "B200+:1")
+GPU_SPEC = os.environ.get("JAIDE_BENCH_GPU", "B200+:8")
 TIMEOUT_SEC = int(os.environ.get("JAIDE_BENCH_TIMEOUT", "86400"))
 CPU_TIMEOUT_SEC = int(os.environ.get("JAIDE_CPU_TIMEOUT", "7200"))
 MODEL_DIM = int(os.environ.get("JAIDE_BENCH_MODEL_DIM", "5120"))
 NUM_LAYERS = int(os.environ.get("JAIDE_BENCH_LAYERS", "54"))
-BATCH_SIZE = int(os.environ.get("JAIDE_BENCH_BATCH", "2"))
+BATCH_SIZE = int(os.environ.get("JAIDE_BENCH_BATCH", "64"))
 EPOCHS = int(os.environ.get("JAIDE_BENCH_EPOCHS", "1"))
-SAMPLE_CAP = int(os.environ.get("JAIDE_BENCH_SAMPLE_CAP", "50000"))
+SAMPLE_CAP = int(os.environ.get("JAIDE_BENCH_SAMPLE_CAP", "2000000"))
 MAX_SEQ_LEN = int(os.environ.get("JAIDE_BENCH_MAX_SEQ_LEN", "256"))
 LEARNING_RATE = os.environ.get("JAIDE_BENCH_LR", "0.0001")
 REASONING_CYCLES = int(os.environ.get("JAIDE_BENCH_REASONING_CYCLES", "1"))
 RELATIONAL_PASS_INTERVAL = int(os.environ.get("JAIDE_BENCH_RELATIONAL_PASS_INTERVAL", "50"))
+NUM_GPUS = int(os.environ.get("JAIDE_BENCH_NUM_GPUS", "8"))
+RECONSTRUCTION_ALPHA = os.environ.get("JAIDE_BENCH_RECONSTRUCTION_ALPHA", "0.3")
+PHASE_A_STEPS = int(os.environ.get("JAIDE_BENCH_PHASE_A_STEPS", "500"))
+PHASE_B_STEPS = int(os.environ.get("JAIDE_BENCH_PHASE_B_STEPS", "2000"))
+SHUFFLE_TARGET_CONTROL = os.environ.get("JAIDE_BENCH_SHUFFLE_TARGET_CONTROL", "0")
+TARGET_SOURCE_FROZEN = os.environ.get("JAIDE_BENCH_TARGET_SOURCE_FROZEN", "1")
+SPECTRAL_DEPTH_COMPENSATION = os.environ.get("JAIDE_BENCH_SPECTRAL_DEPTH_COMPENSATION", "1")
 
 app = modal.App(APP_NAME)
 
@@ -202,6 +210,121 @@ def _run(
     if check and proc.returncode != 0:
         raise SystemExit(f"command failed rc={proc.returncode}: {' '.join(cmd)}")
     return proc.returncode, out, dt
+
+def _run_multirank(
+    cmd: List[str],
+    cwd: str,
+    base_env: Dict[str, str],
+    num_gpus: int,
+    nccl_id_path: str,
+    timeout: int,
+) -> Tuple[int, str, float]:
+    if num_gpus <= 0:
+        raise ValueError("num_gpus must be >= 1")
+    if timeout <= 0:
+        raise ValueError("timeout must be positive")
+
+    _log(f">>> multirank {' '.join(cmd)} ranks={num_gpus} (cwd={cwd})")
+    t0 = time.monotonic()
+    deadline = t0 + timeout
+
+    for stale in [nccl_id_path, nccl_id_path + ".ready"]:
+        stale_path = Path(stale)
+        if stale_path.exists():
+            stale_path.unlink()
+
+    rank_envs: List[Dict[str, str]] = []
+    for rank_index in range(num_gpus):
+        rank_env = base_env.copy()
+        rank_env["WORLD_SIZE"] = str(num_gpus)
+        rank_env["RANK"] = str(rank_index)
+        rank_env["LOCAL_RANK"] = str(rank_index)
+        rank_env["JAIDE_NCCL_ID_PATH"] = nccl_id_path
+        rank_envs.append(rank_env)
+
+    procs: List[subprocess.Popen] = []
+    fd_to_rank: Dict[int, int] = {}
+    output_chunks: List[bytes] = []
+    selector = selectors.DefaultSelector()
+    timed_out = False
+
+    try:
+        for rank_index in range(num_gpus):
+            proc = subprocess.Popen(
+                cmd,
+                cwd=cwd,
+                env=rank_envs[rank_index],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                stdin=subprocess.DEVNULL,
+                bufsize=0,
+                start_new_session=True,
+            )
+            if proc.stdout is None:
+                procs.append(proc)
+                for started in procs:
+                    _terminate_process_group(started)
+                raise RuntimeError(f"rank {rank_index} stdout pipe was not created")
+            procs.append(proc)
+            selector.register(proc.stdout, selectors.EVENT_READ)
+            fd_to_rank[proc.stdout.fileno()] = rank_index
+
+        open_streams = num_gpus
+        while True:
+            now = time.monotonic()
+            if now >= deadline:
+                timed_out = True
+                for proc in procs:
+                    _terminate_process_group(proc)
+                break
+
+            if open_streams == 0 and all(proc.poll() is not None for proc in procs):
+                break
+
+            events = selector.select(timeout=min(1.0, max(0.05, deadline - now)))
+            if not events:
+                if open_streams == 0 and all(proc.poll() is not None for proc in procs):
+                    break
+                continue
+
+            for key, _ in events:
+                rank_index = fd_to_rank.get(key.fd, -1)
+                try:
+                    chunk = os.read(key.fd, 65536)
+                except OSError:
+                    chunk = b""
+                if not chunk:
+                    selector.unregister(key.fileobj)
+                    open_streams -= 1
+                    continue
+                prefix = f"[rank {rank_index}] ".encode()
+                for line in chunk.splitlines(keepends=True):
+                    output_chunks.append(prefix + line)
+                sys.stdout.buffer.write(chunk)
+                sys.stdout.buffer.flush()
+
+        for proc in procs:
+            if proc.poll() is None:
+                proc.wait()
+    finally:
+        selector.close()
+        for proc in procs:
+            if proc.stdout:
+                try:
+                    proc.stdout.close()
+                except OSError:
+                    pass
+
+    dt = time.monotonic() - t0
+    combined_out = b"".join(output_chunks).decode("utf-8", errors="replace")
+    returncodes = [proc.returncode for proc in procs]
+    failures = [code for code in returncodes if code != 0]
+    combined_rc = 0 if not failures else max(failures)
+    _log(f"<<< multirank ranks={num_gpus} rcs={returncodes} dt={dt:.2f}s")
+    if timed_out:
+        raise subprocess.TimeoutExpired(cmd, timeout, output=combined_out.encode("utf-8"))
+    return combined_rc, combined_out, dt
+
 
 def _write_report(report_dir: Path, name: str, content: str) -> None:
     report_dir.mkdir(parents=True, exist_ok=True)
@@ -502,8 +625,7 @@ def run_gpu_train_and_infer(
         _log("=" * 70)
 
         train_env = env.copy()
-        train_env["WORLD_SIZE"] = "1"
-        train_env["RANK"] = "0"
+        train_env["WORLD_SIZE"] = str(NUM_GPUS)
         train_env["MASTER_ADDR"] = "127.0.0.1"
         train_env["MASTER_PORT"] = "29500"
         train_env["JAIDE_EPOCHS"] = str(EPOCHS)
@@ -518,6 +640,12 @@ def run_gpu_train_and_infer(
         train_env["JAIDE_LEARNING_RATE"] = LEARNING_RATE
         train_env["JAIDE_REASONING_CYCLES"] = str(REASONING_CYCLES)
         train_env["JAIDE_RELATIONAL_PASS_INTERVAL"] = str(RELATIONAL_PASS_INTERVAL)
+        train_env["JAIDE_RECONSTRUCTION_ALPHA"] = RECONSTRUCTION_ALPHA
+        train_env["JAIDE_PHASE_A_STEPS"] = str(PHASE_A_STEPS)
+        train_env["JAIDE_PHASE_B_STEPS"] = str(PHASE_B_STEPS)
+        train_env["JAIDE_SHUFFLE_TARGET_CONTROL"] = SHUFFLE_TARGET_CONTROL
+        train_env["JAIDE_TARGET_SOURCE_FROZEN"] = TARGET_SOURCE_FROZEN
+        train_env["JAIDE_SPECTRAL_DEPTH_COMPENSATION"] = SPECTRAL_DEPTH_COMPENSATION
         vocab_file = Path("/checkpoints/tokenizer.vocab")
         if vocab_file.is_file() and vocab_file.stat().st_size > 0:
             train_env["JAIDE_VOCAB_READY"] = "1"
@@ -545,25 +673,41 @@ def run_gpu_train_and_infer(
                 p.unlink()
 
         t0 = time.time()
-        rc_c, out_c, _ = _run(
-            [str(distributed_bin)],
+        rc_c, out_c, _ = _run_multirank(
+            cmd=[str(distributed_bin)],
             cwd=project_dir,
-            env=train_env,
-            check=False,
+            base_env=train_env,
+            num_gpus=NUM_GPUS,
+            nccl_id_path="/tmp/jaide_nccl_id",
             timeout=72000,
         )
         phase_c_duration = time.time() - t0
 
         loss_curve: List[Tuple[int, float]] = []
+        recon_curve: List[Tuple[int, float]] = []
+        source_rms_curve: List[Tuple[int, float]] = []
         epoch_metrics: List[Dict[str, Any]] = []
         for line in out_c.splitlines():
             if "[Step " in line and "Loss:" in line:
                 try:
                     s_part = line.split("[Step ")[1].split("]")[0].strip()
+                    step_index = int(s_part)
                     l_part = line.split("Loss:")[1].strip().split()[0]
-                    loss_curve.append((int(s_part), float(l_part)))
+                    loss_curve.append((step_index, float(l_part)))
                 except (ValueError, IndexError):
-                    pass
+                    continue
+                if "Recon:" in line:
+                    try:
+                        r_part = line.split("Recon:")[1].strip().split()[0]
+                        recon_curve.append((step_index, float(r_part)))
+                    except (ValueError, IndexError):
+                        pass
+                if "SourceRMS:" in line:
+                    try:
+                        rms_part = line.split("SourceRMS:")[1].strip().split()[0]
+                        source_rms_curve.append((step_index, float(rms_part)))
+                    except (ValueError, IndexError):
+                        pass
             if line.startswith("[Epoch "):
                 try:
                     after_bracket = line.split("]", 1)[1]
@@ -592,6 +736,25 @@ def run_gpu_train_and_infer(
             "loss_curve_length": len(loss_curve),
             "first_loss": loss_curve[0][1] if loss_curve else None,
             "last_loss": loss_curve[-1][1] if loss_curve else None,
+            "recon_curve_length": len(recon_curve),
+            "first_recon": recon_curve[0][1] if recon_curve else None,
+            "last_recon": recon_curve[-1][1] if recon_curve else None,
+            "recon_converged": (
+                len(recon_curve) >= 2 and recon_curve[-1][1] < recon_curve[0][1]
+            ) if recon_curve else False,
+            "first_source_rms": source_rms_curve[0][1] if source_rms_curve else None,
+            "last_source_rms": source_rms_curve[-1][1] if source_rms_curve else None,
+            "source_collapse_suspected": (
+                len(source_rms_curve) >= 2
+                and source_rms_curve[0][1] > 0.0
+                and source_rms_curve[-1][1] < source_rms_curve[0][1] * 0.5
+            ) if source_rms_curve else False,
+            "num_gpus": NUM_GPUS,
+            "reconstruction_alpha": RECONSTRUCTION_ALPHA,
+            "phase_a_steps": PHASE_A_STEPS,
+            "phase_b_steps": PHASE_B_STEPS,
+            "shuffle_target_control": SHUFFLE_TARGET_CONTROL,
+            "effective_batch_size": BATCH_SIZE * NUM_GPUS,
             "epoch_metrics": epoch_metrics,
             "training_metrics_json": training_metrics_json,
             "converged": (
@@ -603,6 +766,16 @@ def run_gpu_train_and_infer(
             report_dir,
             "phase_c_loss_curve.jsonl",
             "\n".join(json.dumps({"step": s, "loss": l}) for s, l in loss_curve),
+        )
+        _write_report(
+            report_dir,
+            "phase_c_recon_curve.jsonl",
+            "\n".join(json.dumps({"step": s, "recon": r}) for s, r in recon_curve),
+        )
+        _write_report(
+            report_dir,
+            "phase_c_source_rms_curve.jsonl",
+            "\n".join(json.dumps({"step": s, "source_rms": v}) for s, v in source_rms_curve),
         )
         checkpoint_volume.commit()
 
@@ -625,7 +798,7 @@ def run_gpu_train_and_infer(
         srv_log_path = report_dir / "phase_d_server.log"
         srv_f = open(srv_log_path, "w")
         srv_proc = subprocess.Popen(
-            [str(inference_bin), "--port", "8080", "--host", "127.0.0.1"],
+            [str(inference_bin), "--port", "8080", "--host", "127.0.0.1", "--allow-anonymous"],
             cwd=project_dir,
             env=inf_env,
             stdout=srv_f,
@@ -696,6 +869,19 @@ def run_gpu_train_and_infer(
                 except Exception:
                     pass
 
+                generated_tokens: List[int] = []
+                generated_text_value = ""
+                if isinstance(parsed, dict):
+                    raw_tokens = parsed.get("tokens")
+                    if isinstance(raw_tokens, list):
+                        generated_tokens = [t for t in raw_tokens if isinstance(t, int)]
+                    raw_text = parsed.get("text")
+                    if isinstance(raw_text, str):
+                        generated_text_value = raw_text
+
+                distinct_tokens = len(set(generated_tokens))
+                non_reserved = [t for t in generated_tokens if t >= 4]
+
                 result["phases"]["D_inference"] = {
                     "returncode": rc_i,
                     "duration_s": round(inference_duration, 2),
@@ -705,6 +891,14 @@ def run_gpu_train_and_infer(
                     "response_parsed": parsed,
                     "server_up": True,
                     "model_path": model_path,
+                    "generated_token_count": len(generated_tokens),
+                    "generated_distinct_tokens": distinct_tokens,
+                    "generated_non_reserved_count": len(non_reserved),
+                    "generated_text_length": len(generated_text_value),
+                    "generation_produced_output": len(generated_tokens) > 0,
+                    "generation_is_degenerate": (
+                        len(generated_tokens) > 1 and distinct_tokens <= 1
+                    ),
                 }
                 _write_report(report_dir, "phase_d_inference.log", out_i)
         finally:
@@ -745,6 +939,24 @@ def main():
         raise ValueError("JAIDE_BENCH_REASONING_CYCLES must be positive")
     if RELATIONAL_PASS_INTERVAL <= 0:
         raise ValueError("JAIDE_BENCH_RELATIONAL_PASS_INTERVAL must be positive")
+    if NUM_GPUS <= 0:
+        raise ValueError("JAIDE_BENCH_NUM_GPUS must be a positive integer")
+    try:
+        reconstruction_alpha_value = float(RECONSTRUCTION_ALPHA)
+    except ValueError:
+        raise ValueError("JAIDE_BENCH_RECONSTRUCTION_ALPHA must be a float in [0.0, 1.0]")
+    if not 0.0 <= reconstruction_alpha_value <= 1.0:
+        raise ValueError("JAIDE_BENCH_RECONSTRUCTION_ALPHA must be a float in [0.0, 1.0]")
+    if PHASE_A_STEPS < 0:
+        raise ValueError("JAIDE_BENCH_PHASE_A_STEPS must be >= 0")
+    if PHASE_B_STEPS < 0:
+        raise ValueError("JAIDE_BENCH_PHASE_B_STEPS must be >= 0")
+    if SHUFFLE_TARGET_CONTROL not in ("0", "1", "true", "false"):
+        raise ValueError("JAIDE_BENCH_SHUFFLE_TARGET_CONTROL must be 0, 1, true or false")
+    if TARGET_SOURCE_FROZEN not in ("0", "1", "true", "false"):
+        raise ValueError("JAIDE_BENCH_TARGET_SOURCE_FROZEN must be 0, 1, true or false")
+    if SPECTRAL_DEPTH_COMPENSATION not in ("0", "1", "true", "false"):
+        raise ValueError("JAIDE_BENCH_SPECTRAL_DEPTH_COMPENSATION must be 0, 1, true or false")
     learning_rate_value = float(LEARNING_RATE)
     if not learning_rate_value > 0.0 or not learning_rate_value < float("inf"):
         raise ValueError("JAIDE_BENCH_LR must be finite and positive")

@@ -463,3 +463,82 @@ entry graph_batch_encode [n] (data_hashes: [n]u64) (_seed: u64) : ([]u64, []f32,
     in if node_i > pred_k then node_i - pred_k - 1 else -1i64
   )
   in (copy data_hashes, re_a, im_a, re_b, im_b, edge_srcs, edge_tgts)
+
+entry batch_add_reconstruction_delta_masked [batch_size][seq_len][d]
+  (forward_delta: [batch_size][seq_len][d]f16)
+  (reconstructed: [batch_size][seq_len][d]f16)
+  (original: [batch_size][seq_len][d]f16)
+  (lengths: [batch_size]i64)
+  (alpha: f16)
+  (forward_scale: f16)
+  : *[batch_size][seq_len][d]f16 =
+  let valid_tokens = i64.sum (map (\length -> i64.max 0 (i64.min seq_len length)) lengths)
+  let count = if valid_tokens > 0 then valid_tokens * d else 1
+  let count_f32 = f32.i64 count
+  let alpha_f32 = f32.f16 alpha
+  let forward_scale_f32 = f32.f16 forward_scale
+  in map2 (\length bi ->
+    let fd = forward_delta[bi]
+    let rc = reconstructed[bi]
+    let og = original[bi]
+    let limit = i64.max 0 (i64.min seq_len length)
+    in map (\j ->
+      let active = j < limit
+      in map3 (\f r o ->
+        let f_f32 = f32.f16 f
+        let safe_f = if f32.isnan f_f32 || f32.isinf f_f32 then 0f32 else f_f32
+        in if active
+           then
+             let diff = f32.f16 r - f32.f16 o
+             let safe_diff = if f32.isnan diff || f32.isinf diff
+                             then 0f32
+                             else f32.max (-100f32) (f32.min 100f32 diff)
+             let combined = forward_scale_f32 * safe_f
+                            + alpha_f32 * 2f32 * safe_diff / count_f32
+             let bounded = f32.max (-65504f32) (f32.min 65504f32 combined)
+             in f16.f32 bounded
+           else
+             let scaled = forward_scale_f32 * safe_f
+             let bounded = f32.max (-65504f32) (f32.min 65504f32 scaled)
+             in f16.f32 bounded
+      ) fd[j] rc[j] og[j]
+    ) (iota seq_len)
+  ) lengths (iota batch_size)
+
+entry batch_compute_reconstruction_loss_masked [batch_size][seq_len][d]
+  (reconstructed: [batch_size][seq_len][d]f16)
+  (original: [batch_size][seq_len][d]f16)
+  (lengths: [batch_size]i64)
+  : f16 =
+  let squared_diff_f32 = map2 (\length bi ->
+    let rc = reconstructed[bi]
+    let og = original[bi]
+    let limit = i64.max 0 (i64.min seq_len length)
+    in map (\j ->
+      let active = j < limit
+      in map2 (\r o ->
+        if active
+        then
+          let diff = f32.f16 r - f32.f16 o
+          in if f32.isnan diff || f32.isinf diff then 0f32 else diff * diff
+        else 0f32
+      ) rc[j] og[j]
+    ) (iota seq_len)
+  ) lengths (iota batch_size)
+  let valid_tokens = i64.sum (map (\length -> i64.max 0 (i64.min seq_len length)) lengths)
+  let count = valid_tokens * d
+  let total = f32.sum (flatten (flatten squared_diff_f32))
+  let safe_total = if f32.isnan total || f32.isinf total then 0f32 else total
+  in if count <= 0
+     then f16.i32 0
+     else f16.f32 (safe_total / f32.i64 count)
+
+entry embedding_sum_squares [vocab_size][dim] (source: [vocab_size][dim]f16) : f32 =
+  let squared = map (\row ->
+    map (\v ->
+      let x = f32.f16 v
+      in if f32.isnan x || f32.isinf x then 0f32 else x * x
+    ) row
+  ) source
+  let total = f32.sum (flatten squared)
+  in if f32.isnan total || f32.isinf total then 0f32 else total

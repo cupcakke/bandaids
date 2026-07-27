@@ -239,6 +239,31 @@ pub extern "c" fn futhark_entry_compute_initial_grad_l2_masked(
     in2_lengths: ?*const struct_futhark_i64_1d,
 ) c_int;
 
+pub extern "c" fn futhark_entry_batch_add_reconstruction_delta_masked(
+    ctx: ?*struct_futhark_context,
+    out: ?*?*struct_futhark_f16_3d,
+    in0_forward_delta: ?*const struct_futhark_f16_3d,
+    in1_reconstructed: ?*const struct_futhark_f16_3d,
+    in2_original: ?*const struct_futhark_f16_3d,
+    in3_lengths: ?*const struct_futhark_i64_1d,
+    in4_alpha: u16,
+    in5_forward_scale: u16,
+) c_int;
+
+pub extern "c" fn futhark_entry_batch_compute_reconstruction_loss_masked(
+    ctx: ?*struct_futhark_context,
+    out: ?*u16,
+    in0_reconstructed: ?*const struct_futhark_f16_3d,
+    in1_original: ?*const struct_futhark_f16_3d,
+    in2_lengths: ?*const struct_futhark_i64_1d,
+) c_int;
+
+pub extern "c" fn futhark_entry_embedding_sum_squares(
+    ctx: ?*struct_futhark_context,
+    out: ?*f32,
+    in0_source: ?*const struct_futhark_f16_2d,
+) c_int;
+
 
 pub extern "c" fn futhark_entry_batch_gradients_full(
     ctx: ?*struct_futhark_context,
