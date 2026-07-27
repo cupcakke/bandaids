@@ -1,0 +1,9 @@
+.zig-cache/
+zig-out/
+__pycache__/
+*.pyc
+src/hw/accel/*.c
+src/hw/accel/*.h
+src/hw/accel/futhark_kernels
+src/hw/accel/main_gpu
+lib/github.com/
