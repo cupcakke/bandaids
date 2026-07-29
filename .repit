@@ -1,0 +1,98 @@
+modules = ["python-base-3.13"]
+[agent]
+expertMode = true
+
+entrypoint = "scripts/modal_status_bench.py"
+
+modules = ["python-3.11"]
+
+hidden = [".zig-cache", "zig-out", ".venv", "__pycache__"]
+
+[nix]
+channel = "stable-25_05"
+
+[env]
+PYTHONUNBUFFERED = "1"
+MODAL_PROFILE = "kutyamajom"
+
+[deployment]
+run = ["python", "scripts/modal_status_bench.py"]
+deploymentTarget = "cloudrun"
+
+[workflows]
+runButton = "Project"
+
+[[workflows.workflow]]
+name = "Setup Modal Token"
+mode = "sequential"
+author = "agent"
+
+[workflows.workflow.metadata]
+outputType = "console"
+
+[[workflows.workflow.tasks]]
+task = "shell.exec"
+args = "bash scripts/setup_modal_token.sh"
+
+[[workflows.workflow]]
+name = "Modal App List"
+mode = "sequential"
+author = "agent"
+
+[[workflows.workflow.tasks]]
+task = "shell.exec"
+args = "uv run modal app list"
+
+[workflows.workflow.metadata]
+outputType = "console"
+
+[[workflows.workflow]]
+name = "Modal Report Volume Ls"
+mode = "sequential"
+author = "agent"
+
+[[workflows.workflow.tasks]]
+task = "shell.exec"
+args = "uv run modal volume ls jaide-bench-reports"
+
+[workflows.workflow.metadata]
+outputType = "console"
+
+[[workflows.workflow]]
+name = "Project"
+mode = "parallel"
+author = "agent"
+
+[[workflows.workflow.tasks]]
+task = "workflow.run"
+args = "Setup Modal Token"
+
+[[workflows.workflow.tasks]]
+task = "workflow.run"
+args = "Modal App List"
+
+[[workflows.workflow.tasks]]
+task = "workflow.run"
+args = "Modal Report Volume Ls"
+
+[[workflows.workflow.tasks]]
+task = "workflow.run"
+args = "Run Modal Status Bench"
+
+[[workflows.workflow]]
+name = "Run Modal Status Bench"
+author = "agent"
+
+[workflows.workflow.metadata]
+outputType = "console"
+
+[[workflows.workflow.tasks]]
+task = "shell.exec"
+args = "uv run modal run --detach scripts/modal_status_bench.py"
+
+[[ports]]
+localPort = 8080
+externalPort = 80
+
+[gitHubImport]
+requiredFiles = [".replit", "replit.nix"]
