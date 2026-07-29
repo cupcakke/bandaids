@@ -12,6 +12,848 @@ const alignment = 32;
 const vector_width = 8;
 const Vec8 = @Vector(vector_width, f32);
 
+pub const NC: usize = 4096;
+pub const KC: usize = 256;
+pub const MC: usize = 256;
+pub const NR: usize = 8;
+pub const MR: usize = 8;
+pub const huge_page_size: usize = 2 * 1024 * 1024;
+pub const hugePageSetupCommand = "echo 2000 > /proc/sys/vm/nr_hugepages";
+pub const buildCommand = "zig build-exe -OReleaseFast -mcpu=native -fno-strip -femit-bin=gemm_bench src/gemm.zig";
+
+const max_worker_cores: usize = 1024;
+const map_private: u32 = 0x00000002;
+const map_anonymous: u32 = 0x00000020;
+const map_hugetlb: u32 = 0x00040000;
+const map_huge_2mb: u32 = 21 << 26;
+
+var global_huge_attempts: usize = 0;
+var global_huge_successes: usize = 0;
+var global_huge_fallbacks: usize = 0;
+
+pub const HugePageStats = struct {
+    attempts: usize,
+    successes: usize,
+    fallbacks: usize,
+};
+
+pub fn hugePageStats() HugePageStats {
+    return .{
+        .attempts = @atomicLoad(usize, &global_huge_attempts, .acquire),
+        .successes = @atomicLoad(usize, &global_huge_successes, .acquire),
+        .fallbacks = @atomicLoad(usize, &global_huge_fallbacks, .acquire),
+    };
+}
+
+fn roundUpToHugePage(len: usize) !usize {
+    const sum = @addWithOverflow(len, huge_page_size - 1);
+    if (sum[1] != 0) return Error.Overflow;
+    return sum[0] & ~(huge_page_size - 1);
+}
+
+const HugeMapping = struct {
+    address: usize,
+    mapped_len: usize,
+    next: ?*HugeMapping,
+};
+
+pub const HugePageAllocator = struct {
+    parent: Allocator,
+    mutex: std.Thread.Mutex = .{},
+    parent_mutex: std.Thread.Mutex = .{},
+    mappings: ?*HugeMapping = null,
+
+    pub fn init(parent: ?Allocator) HugePageAllocator {
+        return .{ .parent = parent orelse std.heap.page_allocator };
+    }
+
+    pub fn create(parent: ?Allocator) !*HugePageAllocator {
+        const actual_parent = parent orelse std.heap.page_allocator;
+        const self = try actual_parent.create(HugePageAllocator);
+        self.* = HugePageAllocator.init(actual_parent);
+        return self;
+    }
+
+    pub fn allocator(self: *HugePageAllocator) Allocator {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    pub fn deinit(self: *HugePageAllocator) void {
+        while (true) {
+            self.mutex.lock();
+            const mapping = self.mappings orelse {
+                self.mutex.unlock();
+                break;
+            };
+            self.mappings = mapping.next;
+            self.mutex.unlock();
+            const ptr: [*]align(mem.page_size) const u8 = @ptrFromInt(mapping.address);
+            std.posix.munmap(ptr[0..mapping.mapped_len]);
+            self.parent_mutex.lock();
+            self.parent.destroy(mapping);
+            self.parent_mutex.unlock();
+        }
+    }
+
+    pub fn isHugePointer(self: *HugePageAllocator, pointer: *const anyopaque) bool {
+        const address = @intFromPtr(pointer);
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        var current = self.mappings;
+        while (current) |mapping| : (current = mapping.next) {
+            if (mapping.address == address) return true;
+        }
+        return false;
+    }
+
+    fn createMapping(self: *HugePageAllocator) !*HugeMapping {
+        self.parent_mutex.lock();
+        defer self.parent_mutex.unlock();
+        return self.parent.create(HugeMapping);
+    }
+
+    fn destroyMapping(self: *HugePageAllocator, mapping: *HugeMapping) void {
+        self.parent_mutex.lock();
+        self.parent.destroy(mapping);
+        self.parent_mutex.unlock();
+    }
+
+    fn registerMapping(self: *HugePageAllocator, mapping: *HugeMapping, address: usize, mapped_len: usize) void {
+        self.mutex.lock();
+        mapping.* = .{
+            .address = address,
+            .mapped_len = mapped_len,
+            .next = self.mappings,
+        };
+        self.mappings = mapping;
+        self.mutex.unlock();
+    }
+
+    fn takeMapping(self: *HugePageAllocator, address: usize) ?HugeMapping {
+        self.mutex.lock();
+        var link = &self.mappings;
+        while (link.*) |mapping| {
+            if (mapping.address == address) {
+                link.* = mapping.next;
+                const value = mapping.*;
+                self.mutex.unlock();
+                self.destroyMapping(mapping);
+                return value;
+            }
+            link = &mapping.next;
+        }
+        self.mutex.unlock();
+        return null;
+    }
+
+    fn hasMapping(self: *HugePageAllocator, address: usize) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        var current = self.mappings;
+        while (current) |mapping| : (current = mapping.next) {
+            if (mapping.address == address) return true;
+        }
+        return false;
+    }
+
+    fn mapHuge(self: *HugePageAllocator, mapped_len: usize) ![*]u8 {
+        if (comptime builtin.os.tag != .linux) return error.UnsupportedOperatingSystem;
+        const mapping = self.createMapping() catch return error.HugePageMetadataOutOfMemory;
+        errdefer self.destroyMapping(mapping);
+        _ = @atomicRmw(usize, &global_huge_attempts, .Add, 1, .monotonic);
+        const flags: std.posix.MAP = @bitCast(map_private | map_anonymous | map_hugetlb | map_huge_2mb);
+        const mapped = try std.posix.mmap(null, mapped_len, std.posix.PROT.READ | std.posix.PROT.WRITE, flags, -1, 0);
+        if (!mem.isAligned(@intFromPtr(mapped.ptr), huge_page_size)) {
+            std.posix.munmap(mapped);
+            return error.HugePageAlignmentFailure;
+        }
+        self.registerMapping(mapping, @intFromPtr(mapped.ptr), mapped.len);
+        _ = @atomicRmw(usize, &global_huge_successes, .Add, 1, .monotonic);
+        return mapped.ptr;
+    }
+
+    fn parentAlloc(self: *HugePageAllocator, len: usize, log2_alignment: u8, ret_addr: usize) ?[*]u8 {
+        self.parent_mutex.lock();
+        defer self.parent_mutex.unlock();
+        return self.parent.rawAlloc(len, log2_alignment, ret_addr);
+    }
+
+    fn parentResize(self: *HugePageAllocator, buffer: []u8, log2_alignment: u8, new_len: usize, ret_addr: usize) bool {
+        self.parent_mutex.lock();
+        defer self.parent_mutex.unlock();
+        return self.parent.rawResize(buffer, log2_alignment, new_len, ret_addr);
+    }
+
+    fn parentFree(self: *HugePageAllocator, buffer: []u8, log2_alignment: u8, ret_addr: usize) void {
+        self.parent_mutex.lock();
+        self.parent.rawFree(buffer, log2_alignment, ret_addr);
+        self.parent_mutex.unlock();
+    }
+
+    fn allocFn(context: *anyopaque, len: usize, log2_alignment: u8, ret_addr: usize) ?[*]u8 {
+        const self: *HugePageAllocator = @ptrCast(@alignCast(context));
+        if (len < huge_page_size) return self.parentAlloc(len, log2_alignment, ret_addr);
+        if (len % huge_page_size != 0 or log2_alignment > 21) return null;
+        return self.mapHuge(len) catch |err| switch (err) {
+            error.OutOfMemory => blk: {
+                _ = @atomicRmw(usize, &global_huge_fallbacks, .Add, 1, .monotonic);
+                break :blk self.parentAlloc(len, log2_alignment, ret_addr);
+            },
+            else => null,
+        };
+    }
+
+    fn resizeFn(context: *anyopaque, buffer: []u8, log2_alignment: u8, new_len: usize, ret_addr: usize) bool {
+        const self: *HugePageAllocator = @ptrCast(@alignCast(context));
+        if (self.hasMapping(@intFromPtr(buffer.ptr))) return new_len == buffer.len;
+        if (new_len >= huge_page_size) return false;
+        return self.parentResize(buffer, log2_alignment, new_len, ret_addr);
+    }
+
+    fn freeFn(context: *anyopaque, buffer: []u8, log2_alignment: u8, ret_addr: usize) void {
+        const self: *HugePageAllocator = @ptrCast(@alignCast(context));
+        if (self.takeMapping(@intFromPtr(buffer.ptr))) |mapping| {
+            const ptr: [*]align(mem.page_size) const u8 = @ptrCast(@alignCast(buffer.ptr));
+            std.posix.munmap(ptr[0..mapping.mapped_len]);
+            return;
+        }
+        self.parentFree(buffer, log2_alignment, ret_addr);
+    }
+
+    const vtable = Allocator.VTable{
+        .alloc = allocFn,
+        .resize = resizeFn,
+        .free = freeFn,
+    };
+};
+
+fn parseCpuList(text: []const u8, output: []usize) usize {
+    var count: usize = 0;
+    var groups = mem.splitScalar(u8, text, ',');
+    while (groups.next()) |raw_group| {
+        const group = mem.trim(u8, raw_group, " \n\r\t");
+        if (group.len == 0) continue;
+        if (mem.indexOfScalar(u8, group, '-')) |separator| {
+            const first = std.fmt.parseInt(usize, group[0..separator], 10) catch continue;
+            const last = std.fmt.parseInt(usize, group[separator + 1 ..], 10) catch continue;
+            if (last < first) continue;
+            var cpu = first;
+            while (cpu <= last and count < output.len) : (cpu += 1) {
+                output[count] = cpu;
+                count += 1;
+            }
+        } else if (count < output.len) {
+            output[count] = std.fmt.parseInt(usize, group, 10) catch continue;
+            count += 1;
+        }
+    }
+    return count;
+}
+
+fn loadAllowedCpuIds(output: []usize) usize {
+    if (builtin.os.tag == .linux) {
+        var buffer: [8192]u8 = undefined;
+        if (readSmallFile("/sys/fs/cgroup/cpuset.cpus.effective", &buffer)) |text| {
+            const count = parseCpuList(text, output);
+            if (count != 0) return count;
+        }
+        if (readSmallFile("/sys/fs/cgroup/cpuset/cpuset.cpus", &buffer)) |text| {
+            const count = parseCpuList(text, output);
+            if (count != 0) return count;
+        }
+    }
+    const host_count = std.Thread.getCpuCount() catch 1;
+    const count = @min(host_count, output.len);
+    for (output[0..count], 0..) |*slot, index| slot.* = index;
+    return count;
+}
+
+fn readTopologyValue(cpu_id: usize, name: []const u8) ?usize {
+    var path_buffer: [160]u8 = undefined;
+    const path = std.fmt.bufPrint(&path_buffer, "/sys/devices/system/cpu/cpu{d}/topology/{s}", .{ cpu_id, name }) catch return null;
+    var value_buffer: [64]u8 = undefined;
+    const value = readSmallFile(path, &value_buffer) orelse return null;
+    return std.fmt.parseInt(usize, value, 10) catch null;
+}
+
+fn fillEffectiveCoreIds(output: []usize) usize {
+    var allowed: [max_worker_cores]usize = undefined;
+    const allowed_count = loadAllowedCpuIds(&allowed);
+    var packages: [max_worker_cores]usize = undefined;
+    var cores: [max_worker_cores]usize = undefined;
+    var physical_count: usize = 0;
+    for (allowed[0..allowed_count]) |cpu_id| {
+        const package_id = readTopologyValue(cpu_id, "physical_package_id") orelse 0;
+        const core_id = readTopologyValue(cpu_id, "core_id") orelse cpu_id;
+        var duplicate = false;
+        var index: usize = 0;
+        while (index < physical_count) : (index += 1) {
+            if (packages[index] == package_id and cores[index] == core_id) {
+                duplicate = true;
+                break;
+            }
+        }
+        if (!duplicate and physical_count < output.len) {
+            packages[physical_count] = package_id;
+            cores[physical_count] = core_id;
+            output[physical_count] = cpu_id;
+            physical_count += 1;
+        }
+    }
+    if (physical_count == 0) {
+        const fallback_count = @min(allowed_count, output.len);
+        if (fallback_count != 0) {
+            @memcpy(output[0..fallback_count], allowed[0..fallback_count]);
+            physical_count = fallback_count;
+        } else {
+            output[0] = 0;
+            physical_count = 1;
+        }
+    }
+    var quota_limit = physical_count;
+    if (cgroupV2CpuCount()) |count| quota_limit = @min(quota_limit, count);
+    if (cgroupV1CpuCount()) |count| quota_limit = @min(quota_limit, count);
+    return @max(@min(quota_limit, output.len), 1);
+}
+
+pub fn pinThreadToCore(core_id: usize) !void {
+    if (comptime builtin.os.tag != .linux) return error.UnsupportedOperatingSystem;
+    var cpu_set = [_]u64{0} ** 16;
+    const word_index = core_id / 64;
+    if (word_index >= cpu_set.len) return error.InvalidCoreId;
+    cpu_set[word_index] = @as(u64, 1) << @intCast(core_id % 64);
+    const result = std.os.linux.syscall3(.sched_setaffinity, 0, @sizeOf(@TypeOf(cpu_set)), @intFromPtr(&cpu_set));
+    const signed_result: isize = @bitCast(result);
+    if (signed_result < 0 and signed_result >= -4095) return error.ThreadPinFailed;
+}
+
+pub const GemmReport = struct {
+    cores_used: usize = 0,
+    huge_attempts: usize = 0,
+    huge_successes: usize = 0,
+    huge_fallbacks: usize = 0,
+    core_ids: [max_worker_cores]usize = [_]usize{0} ** max_worker_cores,
+    pinned: [max_worker_cores]bool = [_]bool{false} ** max_worker_cores,
+};
+
+var report_mutex: std.Thread.Mutex = .{};
+var last_gemm_report: GemmReport = .{};
+
+pub fn getLastGemmReport() GemmReport {
+    report_mutex.lock();
+    defer report_mutex.unlock();
+    return last_gemm_report;
+}
+
+fn storeGemmReport(report: GemmReport) void {
+    report_mutex.lock();
+    defer report_mutex.unlock();
+    last_gemm_report = report;
+}
+
+pub fn packA(a: []const f32, lda: usize, mc: usize, kc: usize, packed: []align(32) f32) void {
+    @setRuntimeSafety(false);
+    var row: usize = 0;
+    while (row < mc) : (row += 1) {
+        const source_base = row * lda;
+        const destination_base = row * kc;
+        var depth: usize = 0;
+        const vector_limit = kc - kc % vector_width;
+        while (depth < vector_limit) : (depth += vector_width) {
+            const values: Vec8 = a[source_base + depth ..][0..vector_width].*;
+            packed[destination_base + depth ..][0..vector_width].* = values;
+        }
+        while (depth < kc) : (depth += 1) packed[destination_base + depth] = a[source_base + depth];
+    }
+}
+
+pub fn packB(b: []const f32, ldb: usize, kc: usize, nc: usize, packed: []align(32) f32) void {
+    @setRuntimeSafety(false);
+    const padded_nc = mem.alignForward(usize, nc, NR);
+    var column_block: usize = 0;
+    while (column_block < padded_nc) : (column_block += NR) {
+        var depth: usize = 0;
+        while (depth < kc) : (depth += 1) {
+            const destination = column_block * kc + depth * NR;
+            if (column_block + NR <= nc) {
+                const values: Vec8 = b[depth * ldb + column_block ..][0..NR].*;
+                packed[destination..][0..NR].* = values;
+            } else {
+                var column: usize = 0;
+                while (column < NR) : (column += 1) {
+                    const source_column = column_block + column;
+                    packed[destination + column] = if (source_column < nc) b[depth * ldb + source_column] else 0.0;
+                }
+            }
+        }
+    }
+}
+
+noinline fn microKernel(
+    _: [*]align(32) const f32,
+    _: [*]align(32) const f32,
+    _: [*]align(32) f32,
+    _: usize,
+) callconv(.Naked) void {
+    asm volatile (
+        \\.intel_syntax noprefix
+        \\vmovaps ymm0, ymmword ptr [rdx]
+        \\vmovaps ymm1, ymmword ptr [rdx + 32]
+        \\vmovaps ymm2, ymmword ptr [rdx + 64]
+        \\vmovaps ymm3, ymmword ptr [rdx + 96]
+        \\vmovaps ymm4, ymmword ptr [rdx + 128]
+        \\vmovaps ymm5, ymmword ptr [rdx + 160]
+        \\vmovaps ymm6, ymmword ptr [rdx + 192]
+        \\vmovaps ymm7, ymmword ptr [rdx + 224]
+        \\lea r10, [rcx * 4]
+        \\mov rax, rcx
+        \\shr rax, 2
+        \\test rax, rax
+        \\jz .Lgemm_tail
+        \\.Lgemm_k4:
+        \\vmovaps ymm9, ymmword ptr [rsi]
+        \\mov r11, rdi
+        \\vbroadcastss ymm8, dword ptr [r11]
+        \\vfmadd231ps ymm0, ymm8, ymm9
+        \\add r11, r10
+        \\vbroadcastss ymm8, dword ptr [r11]
+        \\vfmadd231ps ymm1, ymm8, ymm9
+        \\add r11, r10
+        \\vbroadcastss ymm8, dword ptr [r11]
+        \\vfmadd231ps ymm2, ymm8, ymm9
+        \\add r11, r10
+        \\vbroadcastss ymm8, dword ptr [r11]
+        \\vfmadd231ps ymm3, ymm8, ymm9
+        \\add r11, r10
+        \\vbroadcastss ymm8, dword ptr [r11]
+        \\vfmadd231ps ymm4, ymm8, ymm9
+        \\add r11, r10
+        \\vbroadcastss ymm8, dword ptr [r11]
+        \\vfmadd231ps ymm5, ymm8, ymm9
+        \\add r11, r10
+        \\vbroadcastss ymm8, dword ptr [r11]
+        \\vfmadd231ps ymm6, ymm8, ymm9
+        \\add r11, r10
+        \\vbroadcastss ymm8, dword ptr [r11]
+        \\vfmadd231ps ymm7, ymm8, ymm9
+        \\add rdi, 4
+        \\add rsi, 32
+        \\vmovaps ymm9, ymmword ptr [rsi]
+        \\mov r11, rdi
+        \\vbroadcastss ymm8, dword ptr [r11]
+        \\vfmadd231ps ymm0, ymm8, ymm9
+        \\add r11, r10
+        \\vbroadcastss ymm8, dword ptr [r11]
+        \\vfmadd231ps ymm1, ymm8, ymm9
+        \\add r11, r10
+        \\vbroadcastss ymm8, dword ptr [r11]
+        \\vfmadd231ps ymm2, ymm8, ymm9
+        \\add r11, r10
+        \\vbroadcastss ymm8, dword ptr [r11]
+        \\vfmadd231ps ymm3, ymm8, ymm9
+        \\add r11, r10
+        \\vbroadcastss ymm8, dword ptr [r11]
+        \\vfmadd231ps ymm4, ymm8, ymm9
+        \\add r11, r10
+        \\vbroadcastss ymm8, dword ptr [r11]
+        \\vfmadd231ps ymm5, ymm8, ymm9
+        \\add r11, r10
+        \\vbroadcastss ymm8, dword ptr [r11]
+        \\vfmadd231ps ymm6, ymm8, ymm9
+        \\add r11, r10
+        \\vbroadcastss ymm8, dword ptr [r11]
+        \\vfmadd231ps ymm7, ymm8, ymm9
+        \\add rdi, 4
+        \\add rsi, 32
+        \\vmovaps ymm9, ymmword ptr [rsi]
+        \\mov r11, rdi
+        \\vbroadcastss ymm8, dword ptr [r11]
+        \\vfmadd231ps ymm0, ymm8, ymm9
+        \\add r11, r10
+        \\vbroadcastss ymm8, dword ptr [r11]
+        \\vfmadd231ps ymm1, ymm8, ymm9
+        \\add r11, r10
+        \\vbroadcastss ymm8, dword ptr [r11]
+        \\vfmadd231ps ymm2, ymm8, ymm9
+        \\add r11, r10
+        \\vbroadcastss ymm8, dword ptr [r11]
+        \\vfmadd231ps ymm3, ymm8, ymm9
+        \\add r11, r10
+        \\vbroadcastss ymm8, dword ptr [r11]
+        \\vfmadd231ps ymm4, ymm8, ymm9
+        \\add r11, r10
+        \\vbroadcastss ymm8, dword ptr [r11]
+        \\vfmadd231ps ymm5, ymm8, ymm9
+        \\add r11, r10
+        \\vbroadcastss ymm8, dword ptr [r11]
+        \\vfmadd231ps ymm6, ymm8, ymm9
+        \\add r11, r10
+        \\vbroadcastss ymm8, dword ptr [r11]
+        \\vfmadd231ps ymm7, ymm8, ymm9
+        \\add rdi, 4
+        \\add rsi, 32
+        \\vmovaps ymm9, ymmword ptr [rsi]
+        \\mov r11, rdi
+        \\vbroadcastss ymm8, dword ptr [r11]
+        \\vfmadd231ps ymm0, ymm8, ymm9
+        \\add r11, r10
+        \\vbroadcastss ymm8, dword ptr [r11]
+        \\vfmadd231ps ymm1, ymm8, ymm9
+        \\add r11, r10
+        \\vbroadcastss ymm8, dword ptr [r11]
+        \\vfmadd231ps ymm2, ymm8, ymm9
+        \\add r11, r10
+        \\vbroadcastss ymm8, dword ptr [r11]
+        \\vfmadd231ps ymm3, ymm8, ymm9
+        \\add r11, r10
+        \\vbroadcastss ymm8, dword ptr [r11]
+        \\vfmadd231ps ymm4, ymm8, ymm9
+        \\add r11, r10
+        \\vbroadcastss ymm8, dword ptr [r11]
+        \\vfmadd231ps ymm5, ymm8, ymm9
+        \\add r11, r10
+        \\vbroadcastss ymm8, dword ptr [r11]
+        \\vfmadd231ps ymm6, ymm8, ymm9
+        \\add r11, r10
+        \\vbroadcastss ymm8, dword ptr [r11]
+        \\vfmadd231ps ymm7, ymm8, ymm9
+        \\add rdi, 4
+        \\add rsi, 32
+        \\dec rax
+        \\jnz .Lgemm_k4
+        \\.Lgemm_tail:
+        \\and rcx, 3
+        \\jz .Lgemm_store
+        \\.Lgemm_k1:
+        \\vmovaps ymm9, ymmword ptr [rsi]
+        \\mov r11, rdi
+        \\vbroadcastss ymm8, dword ptr [r11]
+        \\vfmadd231ps ymm0, ymm8, ymm9
+        \\add r11, r10
+        \\vbroadcastss ymm8, dword ptr [r11]
+        \\vfmadd231ps ymm1, ymm8, ymm9
+        \\add r11, r10
+        \\vbroadcastss ymm8, dword ptr [r11]
+        \\vfmadd231ps ymm2, ymm8, ymm9
+        \\add r11, r10
+        \\vbroadcastss ymm8, dword ptr [r11]
+        \\vfmadd231ps ymm3, ymm8, ymm9
+        \\add r11, r10
+        \\vbroadcastss ymm8, dword ptr [r11]
+        \\vfmadd231ps ymm4, ymm8, ymm9
+        \\add r11, r10
+        \\vbroadcastss ymm8, dword ptr [r11]
+        \\vfmadd231ps ymm5, ymm8, ymm9
+        \\add r11, r10
+        \\vbroadcastss ymm8, dword ptr [r11]
+        \\vfmadd231ps ymm6, ymm8, ymm9
+        \\add r11, r10
+        \\vbroadcastss ymm8, dword ptr [r11]
+        \\vfmadd231ps ymm7, ymm8, ymm9
+        \\add rdi, 4
+        \\add rsi, 32
+        \\dec rcx
+        \\jnz .Lgemm_k1
+        \\.Lgemm_store:
+        \\vmovaps ymmword ptr [rdx], ymm0
+        \\vmovaps ymmword ptr [rdx + 32], ymm1
+        \\vmovaps ymmword ptr [rdx + 64], ymm2
+        \\vmovaps ymmword ptr [rdx + 96], ymm3
+        \\vmovaps ymmword ptr [rdx + 128], ymm4
+        \\vmovaps ymmword ptr [rdx + 160], ymm5
+        \\vmovaps ymmword ptr [rdx + 192], ymm6
+        \\vmovaps ymmword ptr [rdx + 224], ymm7
+        \\vzeroupper
+        \\ret
+        \\.att_syntax prefix
+    );
+}
+
+const GemmContext = struct {
+    a: []const f32,
+    b: []const f32,
+    c: []align(32) f32,
+    m: usize,
+    n: usize,
+    k: usize,
+    lda: usize,
+    ldb: usize,
+    ldc: usize,
+    worker_count: usize,
+    core_ids: []const usize,
+    pinned: []bool,
+    workspace_allocator: Allocator,
+    failure: u8 = 0,
+};
+
+fn setWorkerFailure(context: *GemmContext, code: u8) void {
+    _ = @cmpxchgStrong(u8, &context.failure, 0, code, .acq_rel, .acquire);
+}
+
+fn microKernelEdge(
+    packed_a: []const f32,
+    packed_b: []const f32,
+    c: []f32,
+    ldc: usize,
+    global_row: usize,
+    global_column: usize,
+    local_row: usize,
+    mr: usize,
+    nr: usize,
+    kc: usize,
+) void {
+    @setRuntimeSafety(false);
+    var row: usize = 0;
+    while (row < mr) : (row += 1) {
+        var column: usize = 0;
+        while (column < nr) : (column += 1) {
+            const c_index = (global_row + row) * ldc + global_column + column;
+            var accumulator = c[c_index];
+            var depth: usize = 0;
+            while (depth < kc) : (depth += 1) {
+                accumulator += packed_a[(local_row + row) * kc + depth] * packed_b[depth * NR + column];
+            }
+            c[c_index] = accumulator;
+        }
+    }
+}
+
+fn workerMain(context: *GemmContext, worker_id: usize) void {
+    pinThreadToCore(context.core_ids[worker_id]) catch {
+        context.pinned[worker_id] = false;
+        setWorkerFailure(context, 1);
+        return;
+    };
+    context.pinned[worker_id] = true;
+    const total_ic_blocks = (context.m + MC - 1) / MC;
+    const first_block = total_ic_blocks * worker_id / context.worker_count;
+    const last_block = total_ic_blocks * (worker_id + 1) / context.worker_count;
+    if (first_block == last_block) return;
+    const packed_a_storage = context.workspace_allocator.alignedAlloc(f32, @as(?u29, alignment), huge_page_size / @sizeOf(f32)) catch {
+        setWorkerFailure(context, 2);
+        return;
+    };
+    defer context.workspace_allocator.free(packed_a_storage);
+    const packed_b_storage = context.workspace_allocator.alignedAlloc(f32, @as(?u29, alignment), KC * NC) catch {
+        setWorkerFailure(context, 2);
+        return;
+    };
+    defer context.workspace_allocator.free(packed_b_storage);
+    @memset(packed_a_storage, 0.0);
+    @memset(packed_b_storage, 0.0);
+    const first_row = first_block * MC;
+    const last_row = @min(last_block * MC, context.m);
+    var row = first_row;
+    while (row < last_row) : (row += 1) {
+        @memset(context.c[row * context.ldc ..][0..context.n], 0.0);
+    }
+    var jc: usize = 0;
+    while (jc < context.n) : (jc += NC) {
+        const nc = @min(NC, context.n - jc);
+        const padded_nc = mem.alignForward(usize, nc, NR);
+        var pc: usize = 0;
+        while (pc < context.k) : (pc += KC) {
+            if (@atomicLoad(u8, &context.failure, .acquire) != 0) return;
+            const kc = @min(KC, context.k - pc);
+            const packed_b_len = padded_nc * kc;
+            packB(context.b[pc * context.ldb + jc ..], context.ldb, kc, nc, packed_b_storage[0..packed_b_len]);
+            var block_index = first_block;
+            while (block_index < last_block) : (block_index += 1) {
+                const ic = block_index * MC;
+                if (ic >= context.m) break;
+                const mc = @min(MC, context.m - ic);
+                const packed_a_len = mc * kc;
+                packA(context.a[ic * context.lda + pc ..], context.lda, mc, kc, packed_a_storage[0..packed_a_len]);
+                var jr: usize = 0;
+                while (jr < nc) : (jr += NR) {
+                    const nr = @min(NR, nc - jr);
+                    const b_offset = jr * kc;
+                    const b_pointer: [*]align(32) const f32 = @ptrCast(@alignCast(packed_b_storage.ptr + b_offset));
+                    var ir: usize = 0;
+                    while (ir < mc) : (ir += MR) {
+                        const mr = @min(MR, mc - ir);
+                        if (mr == MR and nr == NR) {
+                            var tile: [MR * NR]f32 align(32) = undefined;
+                            var tile_row: usize = 0;
+                            while (tile_row < MR) : (tile_row += 1) {
+                                const c_offset = (ic + ir + tile_row) * context.ldc + jc + jr;
+                                const values: Vec8 = context.c[c_offset..][0..NR].*;
+                                tile[tile_row * NR ..][0..NR].* = values;
+                            }
+                            const a_pointer: [*]align(32) const f32 = @ptrCast(@alignCast(packed_a_storage.ptr + ir * kc));
+                            const tile_pointer: [*]align(32) f32 = @ptrCast(&tile);
+                            microKernel(a_pointer, b_pointer, tile_pointer, kc);
+                            tile_row = 0;
+                            while (tile_row < MR) : (tile_row += 1) {
+                                const c_offset = (ic + ir + tile_row) * context.ldc + jc + jr;
+                                const values: Vec8 = tile[tile_row * NR ..][0..NR].*;
+                                context.c[c_offset..][0..NR].* = values;
+                            }
+                        } else {
+                            microKernelEdge(
+                                packed_a_storage[0..packed_a_len],
+                                packed_b_storage[b_offset .. b_offset + kc * NR],
+                                context.c,
+                                context.ldc,
+                                ic + ir,
+                                jc + jr,
+                                ir,
+                                mr,
+                                nr,
+                                kc,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn runHighPerformanceGemm(
+    a: []const f32,
+    b: []const f32,
+    c: []align(32) f32,
+    m: usize,
+    n: usize,
+    k: usize,
+    lda: usize,
+    ldb: usize,
+    ldc: usize,
+    workspace_allocator: Allocator,
+    parent_allocator: Allocator,
+    stats_before: HugePageStats,
+) !void {
+    var core_ids_storage: [max_worker_cores]usize = undefined;
+    const worker_count = fillEffectiveCoreIds(&core_ids_storage);
+    const core_ids = try parent_allocator.dupe(usize, core_ids_storage[0..worker_count]);
+    defer parent_allocator.free(core_ids);
+    const pinned = try parent_allocator.alloc(bool, worker_count);
+    defer parent_allocator.free(pinned);
+    @memset(pinned, false);
+    const threads = try parent_allocator.alloc(std.Thread, worker_count);
+    defer parent_allocator.free(threads);
+    var context = GemmContext{
+        .a = a,
+        .b = b,
+        .c = c,
+        .m = m,
+        .n = n,
+        .k = k,
+        .lda = lda,
+        .ldb = ldb,
+        .ldc = ldc,
+        .worker_count = worker_count,
+        .core_ids = core_ids,
+        .pinned = pinned,
+        .workspace_allocator = workspace_allocator,
+    };
+    var started: usize = 0;
+    errdefer {
+        for (threads[0..started]) |thread| thread.join();
+    }
+    while (started < worker_count) : (started += 1) {
+        threads[started] = try std.Thread.spawn(.{}, workerMain, .{ &context, started });
+    }
+    for (threads) |thread| thread.join();
+    const stats_after = hugePageStats();
+    var report = GemmReport{
+        .cores_used = worker_count,
+        .huge_attempts = stats_after.attempts - stats_before.attempts,
+        .huge_successes = stats_after.successes - stats_before.successes,
+        .huge_fallbacks = stats_after.fallbacks - stats_before.fallbacks,
+    };
+    for (0..worker_count) |index| {
+        report.core_ids[index] = core_ids[index];
+        report.pinned[index] = pinned[index];
+    }
+    storeGemmReport(report);
+    switch (@atomicLoad(u8, &context.failure, .acquire)) {
+        0 => return,
+        1 => return error.ThreadPinFailed,
+        2 => return error.OutOfMemory,
+        else => return error.GemmWorkerFailure,
+    }
+}
+
+fn scalarBlockedMatmul(a: *const Tensor, b: *const Tensor, allocator: Allocator) !Tensor {
+    const m = a.shape.dims[0];
+    const k = a.shape.dims[1];
+    const n = b.shape.dims[1];
+    var result = try Tensor.init(allocator, &.{ m, n });
+    errdefer result.deinit();
+    const block: usize = 32;
+    var ii: usize = 0;
+    while (ii < m) : (ii += block) {
+        const i_end = @min(ii + block, m);
+        var kk: usize = 0;
+        while (kk < k) : (kk += block) {
+            const k_end = @min(kk + block, k);
+            var jj: usize = 0;
+            while (jj < n) : (jj += block) {
+                const j_end = @min(jj + block, n);
+                var i = ii;
+                while (i < i_end) : (i += 1) {
+                    var depth = kk;
+                    while (depth < k_end) : (depth += 1) {
+                        const a_value = a.data[i * a.shape.strides[0] + depth * a.shape.strides[1]];
+                        var j = jj;
+                        while (j < j_end) : (j += 1) {
+                            result.data[i * result.shape.strides[0] + j] += a_value * b.data[depth * b.shape.strides[0] + j * b.shape.strides[1]];
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return result;
+}
+
+fn highPerformanceAvailable() bool {
+    if (builtin.os.tag != .linux or builtin.cpu.arch != .x86_64) return false;
+    return std.Target.x86.featureSetHas(builtin.cpu.features, .avx2) and std.Target.x86.featureSetHas(builtin.cpu.features, .fma);
+}
+
+fn highPerformanceMatmul(a: *const Tensor, b: *const Tensor, allocator: Allocator) !Tensor {
+    const m = a.shape.dims[0];
+    const k = a.shape.dims[1];
+    const n = b.shape.dims[1];
+    const stats_before = hugePageStats();
+    var staged_a: Tensor = undefined;
+    var has_staged_a = false;
+    defer if (has_staged_a) staged_a.deinit();
+    var staged_b: Tensor = undefined;
+    var has_staged_b = false;
+    defer if (has_staged_b) staged_b.deinit();
+    const effective_a: *const Tensor = if (a.isHugeBacked()) a else blk: {
+        staged_a = try a.copyHuge(allocator);
+        has_staged_a = true;
+        break :blk &staged_a;
+    };
+    const effective_b: *const Tensor = if (b.isHugeBacked()) b else blk: {
+        staged_b = try b.copyHuge(allocator);
+        has_staged_b = true;
+        break :blk &staged_b;
+    };
+    var result = try Tensor.initHugeUninitialized(allocator, &.{ m, n });
+    errdefer result.deinit();
+    try runHighPerformanceGemm(
+        effective_a.data,
+        effective_b.data,
+        result.data,
+        m,
+        n,
+        k,
+        effective_a.shape.strides[0],
+        effective_b.shape.strides[0],
+        result.shape.strides[0],
+        result.allocator,
+        allocator,
+        stats_before,
+    );
+    return result;
+}
+
 fn readSmallFile(path: []const u8, buf: []u8) ?[]const u8 {
     const file = std.fs.openFileAbsolute(path, .{}) catch return null;
     defer file.close();
@@ -57,12 +899,8 @@ pub fn cgroupSource() []const u8 {
 }
 
 pub fn effectiveCpuCount() usize {
-    if (builtin.os.tag == .linux) {
-        if (cgroupV2CpuCount()) |c| return math.clamp(c, 1, 8);
-        if (cgroupV1CpuCount()) |c| return math.clamp(c, 1, 8);
-    }
-    const host = std.Thread.getCpuCount() catch 1;
-    return math.clamp(@max(host, 1), 1, 8);
+    var core_ids: [max_worker_cores]usize = undefined;
+    return fillEffectiveCoreIds(&core_ids);
 }
 
 pub const TensorIterator = struct {
@@ -149,10 +987,7 @@ pub const Shape = struct {
     }
 
     pub fn deinit(self: *Shape, allocator: Allocator) void {
-        // A Shape can be reached by more than one release() call -- e.g. when a
-        // Tensor is retained and released in place across multiple threads (see
-        // Tensor.release) -- so freeing must be a thread-safe, idempotent,
-        // exactly-once operation on the same Shape instance.
+
         if (self.freed.cmpxchgStrong(false, true, .acq_rel, .acquire) != null) {
             return;
         }
@@ -222,6 +1057,7 @@ pub const Tensor = struct {
     allocator: Allocator,
     refcount: *usize,
     cow: *bool,
+    huge_allocator_owner: ?*HugePageAllocator,
 
     pub fn init(allocator: Allocator, dims: []const usize) !Tensor {
         var shape = try Shape.init(allocator, dims);
@@ -235,7 +1071,70 @@ pub const Tensor = struct {
         const cow = try allocator.create(bool);
         errdefer allocator.destroy(cow);
         cow.* = false;
-        return .{ .data = data, .base_data = data, .shape = shape, .allocator = allocator, .refcount = refcount, .cow = cow };
+        return .{ .data = data, .base_data = data, .shape = shape, .allocator = allocator, .refcount = refcount, .cow = cow, .huge_allocator_owner = null };
+    }
+
+    fn initHugeUninitialized(parent_allocator: Allocator, dims: []const usize) !Tensor {
+        const owner = try HugePageAllocator.create(parent_allocator);
+        errdefer {
+            const parent = owner.parent;
+            owner.deinit();
+            parent.destroy(owner);
+        }
+        const allocator = owner.allocator();
+        var shape = try Shape.init(allocator, dims);
+        errdefer shape.deinit(allocator);
+        const element_count = shape.totalSize();
+        const byte_count_result = @mulWithOverflow(element_count, @sizeOf(f32));
+        if (byte_count_result[1] != 0) return Error.Overflow;
+        const allocation_bytes = try roundUpToHugePage(byte_count_result[0]);
+        const allocation_elements = allocation_bytes / @sizeOf(f32);
+        const base_data = try allocator.alignedAlloc(f32, @as(?u29, alignment), allocation_elements);
+        errdefer allocator.free(base_data);
+        const data = base_data[0..element_count];
+        const refcount = try allocator.create(usize);
+        errdefer allocator.destroy(refcount);
+        refcount.* = 1;
+        const cow = try allocator.create(bool);
+        errdefer allocator.destroy(cow);
+        cow.* = false;
+        return .{
+            .data = data,
+            .base_data = base_data,
+            .shape = shape,
+            .allocator = allocator,
+            .refcount = refcount,
+            .cow = cow,
+            .huge_allocator_owner = owner,
+        };
+    }
+
+    pub fn initHuge(parent_allocator: ?Allocator, dims: []const usize) !Tensor {
+        const tensor = try Tensor.initHugeUninitialized(parent_allocator orelse std.heap.page_allocator, dims);
+        @memset(tensor.data, 0.0);
+        return tensor;
+    }
+
+    pub fn copyHuge(self: *const Tensor, parent_allocator: Allocator) !Tensor {
+        var result = try Tensor.initHugeUninitialized(parent_allocator, self.shape.dims);
+        errdefer result.deinit();
+        const total = self.shape.totalSize();
+        if (self.shape.isContiguous()) {
+            @memcpy(result.data[0..total], self.data[0..total]);
+        } else {
+            var iterator = TensorIterator.init(&self.shape);
+            var index: usize = 0;
+            while (index < total) : (index += 1) {
+                result.data[index] = self.data[iterator.offset];
+                _ = iterator.advance();
+            }
+        }
+        return result;
+    }
+
+    pub fn isHugeBacked(self: *const Tensor) bool {
+        const owner = self.huge_allocator_owner orelse return false;
+        return owner.isHugePointer(@ptrCast(self.base_data.ptr));
     }
 
     pub fn initWithArena(arena: *memory.ArenaAllocator, dims: []const usize) !Tensor {
@@ -260,21 +1159,19 @@ pub const Tensor = struct {
     }
 
     pub fn release(self: *Tensor) void {
-        // Each Tensor value (base or view) owns its own Shape independently of
-        // the shared refcount, so its Shape must always be freed here (Shape.deinit
-        // is idempotent, so repeated release() calls on the very same struct
-        // instance -- e.g. retain()/release() pairs used directly without
-        // creating a new view -- are safe).
-        self.shape.deinit(self.allocator);
+        const allocator = self.allocator;
+        const owner = self.huge_allocator_owner;
+        self.shape.deinit(allocator);
         const old = @atomicRmw(usize, self.refcount, .Sub, 1, .acq_rel);
         if (old == 1) {
-            self.allocator.free(self.base_data);
-            self.allocator.destroy(self.refcount);
-            self.allocator.destroy(self.cow);
-            // Only fully invalidate the struct once the underlying shared
-            // data is actually gone -- a non-final release (old != 1) must
-            // leave refcount/cow/data/allocator valid, since other holders
-            // (or this same value, if retained again) still depend on them.
+            allocator.free(self.base_data);
+            allocator.destroy(self.refcount);
+            allocator.destroy(self.cow);
+            if (owner) |huge_owner| {
+                const parent = huge_owner.parent;
+                huge_owner.deinit();
+                parent.destroy(huge_owner);
+            }
             self.* = undefined;
         }
     }
@@ -298,25 +1195,27 @@ pub const Tensor = struct {
             self.cow.* = false;
             return;
         }
+        const old_allocator = self.allocator;
+        const old_owner = self.huge_allocator_owner;
+        const new_allocator = if (old_owner) |owner| owner.parent else old_allocator;
         const total = self.shape.totalSize();
-        const new_data = try self.allocator.alignedAlloc(f32, @as(?u29, alignment), total);
-        errdefer self.allocator.free(new_data);
-        const contiguous = self.shape.isContiguous();
-        if (contiguous) {
+        const new_data = try new_allocator.alignedAlloc(f32, @as(?u29, alignment), total);
+        errdefer new_allocator.free(new_data);
+        if (self.shape.isContiguous()) {
             @memcpy(new_data, self.data[0..total]);
         } else {
             var iterator = TensorIterator.init(&self.shape);
-            var i: usize = 0;
-            while (i < total) : (i += 1) {
-                new_data[i] = self.data[iterator.offset];
+            var index: usize = 0;
+            while (index < total) : (index += 1) {
+                new_data[index] = self.data[iterator.offset];
                 _ = iterator.advance();
             }
         }
-        const new_refcount = try self.allocator.create(usize);
-        errdefer self.allocator.destroy(new_refcount);
+        const new_refcount = try new_allocator.create(usize);
+        errdefer new_allocator.destroy(new_refcount);
         new_refcount.* = 1;
-        const new_cow = try self.allocator.create(bool);
-        errdefer self.allocator.destroy(new_cow);
+        const new_cow = try new_allocator.create(bool);
+        errdefer new_allocator.destroy(new_cow);
         new_cow.* = false;
         const old_base_data = self.base_data;
         const old_refcount = self.refcount;
@@ -324,12 +1223,19 @@ pub const Tensor = struct {
         const old_count = @atomicRmw(usize, old_refcount, .Sub, 1, .acq_rel);
         self.data = new_data;
         self.base_data = new_data;
+        self.allocator = new_allocator;
         self.refcount = new_refcount;
         self.cow = new_cow;
+        self.huge_allocator_owner = null;
         if (old_count == 1) {
-            self.allocator.free(old_base_data);
-            self.allocator.destroy(old_refcount);
-            self.allocator.destroy(old_cow);
+            old_allocator.free(old_base_data);
+            old_allocator.destroy(old_refcount);
+            old_allocator.destroy(old_cow);
+            if (old_owner) |owner| {
+                const parent = owner.parent;
+                owner.deinit();
+                parent.destroy(owner);
+            }
         }
     }
 
@@ -666,7 +1572,7 @@ pub const Tensor = struct {
         var new_shape = try Shape.init(self.allocator, new_dims);
         errdefer new_shape.deinit(self.allocator);
         if (new_shape.totalSize() != self.shape.totalSize()) return Error.InvalidShape;
-        const old_shape = self.shape;
+        var old_shape = self.shape;
         self.shape = new_shape;
         old_shape.deinit(self.allocator);
     }
@@ -677,13 +1583,13 @@ pub const Tensor = struct {
         errdefer new_shape.deinit(self.allocator);
         if (new_shape.totalSize() != self.shape.totalSize()) return Error.InvalidShape;
         self.retain();
-        return .{ .data = self.data, .base_data = self.base_data, .shape = new_shape, .allocator = self.allocator, .refcount = self.refcount, .cow = self.cow };
+        return .{ .data = self.data, .base_data = self.base_data, .shape = new_shape, .allocator = self.allocator, .refcount = self.refcount, .cow = self.cow, .huge_allocator_owner = self.huge_allocator_owner };
     }
 
     pub fn newView(self: *Tensor, shape: Shape) !Tensor {
         if (shape.totalSize() != self.shape.totalSize()) return Error.InvalidShape;
         self.retain();
-        return .{ .data = self.data, .base_data = self.base_data, .shape = shape, .allocator = self.allocator, .refcount = self.refcount, .cow = self.cow };
+        return .{ .data = self.data, .base_data = self.base_data, .shape = shape, .allocator = self.allocator, .refcount = self.refcount, .cow = self.cow, .huge_allocator_owner = self.huge_allocator_owner };
     }
 
     pub fn slice(self: *Tensor, starts: []const usize, ends: []const usize) !Tensor {
@@ -725,7 +1631,7 @@ pub const Tensor = struct {
         var new_shape = try Shape.initWithStrides(self.allocator, dims_stack[0..axes.len], strides_stack[0..axes.len]);
         errdefer new_shape.deinit(self.allocator);
         self.retain();
-        return .{ .data = self.data, .base_data = self.base_data, .shape = new_shape, .allocator = self.allocator, .refcount = self.refcount, .cow = self.cow };
+        return .{ .data = self.data, .base_data = self.base_data, .shape = new_shape, .allocator = self.allocator, .refcount = self.refcount, .cow = self.cow, .huge_allocator_owner = self.huge_allocator_owner };
     }
 
     pub fn broadcast(self: *Tensor, target_dims: []const usize) !Tensor {
@@ -747,7 +1653,7 @@ pub const Tensor = struct {
         var new_shape = try Shape.initWithStrides(self.allocator, target_dims, strides_stack[0..target_dims.len]);
         errdefer new_shape.deinit(self.allocator);
         self.retain();
-        return .{ .data = self.data, .base_data = self.base_data, .shape = new_shape, .allocator = self.allocator, .refcount = self.refcount, .cow = self.cow };
+        return .{ .data = self.data, .base_data = self.base_data, .shape = new_shape, .allocator = self.allocator, .refcount = self.refcount, .cow = self.cow, .huge_allocator_owner = self.huge_allocator_owner };
     }
 
     pub fn unsqueeze(self: *Tensor, axis: usize) !Tensor {
@@ -769,7 +1675,7 @@ pub const Tensor = struct {
         var new_shape = try Shape.initWithStrides(self.allocator, dims_stack[0 .. self.shape.dims.len + 1], strides_stack[0 .. self.shape.dims.len + 1]);
         errdefer new_shape.deinit(self.allocator);
         self.retain();
-        return .{ .data = self.data, .base_data = self.base_data, .shape = new_shape, .allocator = self.allocator, .refcount = self.refcount, .cow = self.cow };
+        return .{ .data = self.data, .base_data = self.base_data, .shape = new_shape, .allocator = self.allocator, .refcount = self.refcount, .cow = self.cow, .huge_allocator_owner = self.huge_allocator_owner };
     }
 
     pub fn zeros(allocator: Allocator, dims: []const usize) !Tensor {
@@ -1048,64 +1954,10 @@ pub const Tensor = struct {
         const m = a.shape.dims[0];
         const k = a.shape.dims[1];
         const n = b.shape.dims[1];
-        var result = try Tensor.init(allocator, &.{ m, n });
-        var a_contiguous = try a.copy(allocator);
-        defer a_contiguous.deinit();
-        var b_mutable = try b.copy(allocator);
-        defer b_mutable.deinit();
-        var b_transposed_view = try b_mutable.transpose(&.{ 1, 0 });
-        defer b_transposed_view.deinit();
-        var b_transposed = try b_transposed_view.copy(allocator);
-        defer b_transposed.deinit();
-        const Worker = struct {
-            fn run(a_ptr: *const Tensor, bt_ptr: *const Tensor, out_ptr: *Tensor, start: usize, end: usize, k_dim: usize, n_dim: usize) void {
-                const block: usize = 32;
-                var ii: usize = start;
-                while (ii < end) : (ii += block) {
-                    const i_end = @min(ii + block, end);
-                    var jj: usize = 0;
-                    while (jj < n_dim) : (jj += block) {
-                        const j_end = @min(jj + block, n_dim);
-                        var i: usize = ii;
-                        while (i < i_end) : (i += 1) {
-                            var j: usize = jj;
-                            while (j < j_end) : (j += 1) {
-                                var sum_value: f32 = 0.0;
-                                var kk: usize = 0;
-                                const limit = k_dim - k_dim % vector_width;
-                                var accumulator: Vec8 = @splat(0.0);
-                                while (kk < limit) : (kk += vector_width) {
-                                    const av: Vec8 = a_ptr.data[i * a_ptr.shape.strides[0] + kk..][0..vector_width].*;
-                                    const bv: Vec8 = bt_ptr.data[j * bt_ptr.shape.strides[0] + kk..][0..vector_width].*;
-                                    accumulator += av * bv;
-                                }
-                                sum_value += @reduce(.Add, accumulator);
-                                while (kk < k_dim) : (kk += 1) {
-                                    sum_value += a_ptr.data[i * a_ptr.shape.strides[0] + kk * a_ptr.shape.strides[1]] * bt_ptr.data[j * bt_ptr.shape.strides[0] + kk * bt_ptr.shape.strides[1]];
-                                }
-                                out_ptr.data[i * out_ptr.shape.strides[0] + j * out_ptr.shape.strides[1]] = sum_value;
-                            }
-                        }
-                    }
-                }
-            }
-        };
-        const thread_count = @min(effectiveCpuCount(), @min(m, 8));
-        if (thread_count <= 1) {
-            Worker.run(&a_contiguous, &b_transposed, &result, 0, m, k, n);
-        } else {
-            var threads: [8]std.Thread = undefined;
-            var active: usize = 0;
-            const chunk = (m + thread_count - 1) / thread_count;
-            var start: usize = 0;
-            while (start < m and active < thread_count) : (start += chunk) {
-                const end = @min(start + chunk, m);
-                threads[active] = try std.Thread.spawn(.{}, Worker.run, .{ &a_contiguous, &b_transposed, &result, start, end, k, n });
-                active += 1;
-            }
-            for (threads[0..active]) |thread| thread.join();
+        if (highPerformanceAvailable() and a.shape.isContiguous() and b.shape.isContiguous() and m >= 256 and n >= 256 and k >= 256) {
+            return highPerformanceMatmul(a, b, allocator);
         }
-        return result;
+        return scalarBlockedMatmul(a, b, allocator);
     }
 
     pub fn isClose(self: *const Tensor, other: *const Tensor, rtol: f32, atol: f32) !bool {
@@ -1303,6 +2155,91 @@ pub const Tensor = struct {
         return result;
     }
 };
+
+
+fn fillDeterministic(tensor: *Tensor, seed: u64) void {
+    var generator = types.PRNG.init(seed);
+    var index: usize = 0;
+    while (index < tensor.data.len) : (index += 1) {
+        tensor.data[index] = generator.float() - 0.5;
+    }
+}
+
+fn verifyMatmulResult(a: *const Tensor, b: *const Tensor, c: *const Tensor, relative_tolerance: f32) bool {
+    const m = a.shape.dims[0];
+    const k = a.shape.dims[1];
+    const n = b.shape.dims[1];
+    const total_outputs = m * n;
+    const sample_count = @min(total_outputs, 4096);
+    var sample: usize = 0;
+    while (sample < sample_count) : (sample += 1) {
+        const mixed = @as(u64, @intCast(sample)) *% 0x9e3779b97f4a7c15 +% 0xbf58476d1ce4e5b9;
+        const row = @as(usize, @intCast(mixed % @as(u64, @intCast(m))));
+        const column = @as(usize, @intCast((mixed >> 17) % @as(u64, @intCast(n))));
+        var reference: f32 = 0.0;
+        var depth: usize = 0;
+        while (depth < k) : (depth += 1) {
+            reference += a.data[row * a.shape.strides[0] + depth * a.shape.strides[1]] * b.data[depth * b.shape.strides[0] + column * b.shape.strides[1]];
+        }
+        const actual = c.data[row * c.shape.strides[0] + column * c.shape.strides[1]];
+        const scale = @max(@abs(reference), 1.0);
+        if (@abs(actual - reference) > relative_tolerance * scale) return false;
+    }
+    return true;
+}
+
+pub fn benchmarkGemm(parent_allocator: Allocator, m: usize, n: usize, k: usize, minimum_duration_ns: u64) !void {
+    if (m == 0 or n == 0 or k == 0) return Error.InvalidShape;
+    var a = try Tensor.initHuge(parent_allocator, &.{ m, k });
+    defer a.deinit();
+    var b = try Tensor.initHuge(parent_allocator, &.{ k, n });
+    defer b.deinit();
+    fillDeterministic(&a, 0x123456789abcdef0);
+    fillDeterministic(&b, 0xfedcba9876543210);
+    var warmup = try Tensor.matmul(&a, &b, parent_allocator);
+    defer warmup.deinit();
+    if (!verifyMatmulResult(&a, &b, &warmup, 1.0e-4)) return error.VerificationFailed;
+    var last_result: Tensor = undefined;
+    var has_last_result = false;
+    defer if (has_last_result) last_result.deinit();
+    var timer = try std.time.Timer.start();
+    var iterations: usize = 0;
+    var elapsed: u64 = 0;
+    while (elapsed < minimum_duration_ns) {
+        if (has_last_result) {
+            last_result.deinit();
+            has_last_result = false;
+        }
+        last_result = try Tensor.matmul(&a, &b, parent_allocator);
+        has_last_result = true;
+        iterations += 1;
+        elapsed = timer.read();
+    }
+    if (!verifyMatmulResult(&a, &b, &last_result, 1.0e-4)) return error.VerificationFailed;
+    const operations = 2.0 * @as(f64, @floatFromInt(m)) * @as(f64, @floatFromInt(n)) * @as(f64, @floatFromInt(k)) * @as(f64, @floatFromInt(iterations));
+    const seconds = @as(f64, @floatFromInt(elapsed)) / @as(f64, @floatFromInt(std.time.ns_per_s));
+    const gflops = operations / seconds / 1.0e9;
+    const stats = hugePageStats();
+    const success_rate = if (stats.attempts == 0) 0.0 else 100.0 * @as(f64, @floatFromInt(stats.successes)) / @as(f64, @floatFromInt(stats.attempts));
+    const report = getLastGemmReport();
+    const stdout = std.io.getStdOut().writer();
+    try stdout.print("M={d} N={d} K={d} iterations={d} seconds={d:.6} GFLOPS={d:.3}\n", .{ m, n, k, iterations, seconds, gflops });
+    try stdout.print("verification=passed tolerance=1e-4 samples={d}\n", .{@min(m * n, 4096)});
+    try stdout.print("cores_used={d} huge_attempts={d} huge_successes={d} huge_fallbacks={d} huge_success_rate={d:.2}%\n", .{ report.cores_used, stats.attempts, stats.successes, stats.fallbacks, success_rate });
+    var worker: usize = 0;
+    while (worker < report.cores_used) : (worker += 1) {
+        try stdout.print("worker={d} core={d} pinned={}\n", .{ worker, report.core_ids[worker], report.pinned[worker] });
+    }
+}
+
+pub fn main() !void {
+    var arguments = std.process.args();
+    _ = arguments.next();
+    const m = if (arguments.next()) |value| try std.fmt.parseInt(usize, value, 10) else 4096;
+    const n = if (arguments.next()) |value| try std.fmt.parseInt(usize, value, 10) else m;
+    const k = if (arguments.next()) |value| try std.fmt.parseInt(usize, value, 10) else m;
+    try benchmarkGemm(std.heap.page_allocator, m, n, k, 5 * std.time.ns_per_s);
+}
 
 test "Tensor init and basic operations" {
     const allocator = std.testing.allocator;
